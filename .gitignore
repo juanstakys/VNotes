@@ -1,0 +1,12 @@
+# Android local toolchains, generated files and signing keys
+android/.gradle/
+android/**/build/
+android/local.properties
+android/.idea/
+*.iml
+*.keystore
+*.jks
+# Keep the requested distributable APK under releases/, not Gradle output directories.
+android/.signing/
+
+android/.kotlin/
