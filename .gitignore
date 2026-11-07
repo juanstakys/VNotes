@@ -10,3 +10,5 @@ android/.idea/
 android/.signing/
 
 android/.kotlin/
+
+.build-tools/

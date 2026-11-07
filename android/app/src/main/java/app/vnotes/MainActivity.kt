@@ -37,10 +37,16 @@ class MainActivity : Activity() {
     private val prefs by lazy{getSharedPreferences("settings",MODE_PRIVATE)}
     private var threshold=.01;private var silence=2.0;private var done=false;private var ready=false;private var busy=false;private var capturing=false;private var finishing=false
     private var transcribing=false;private var cancelTranscription=false
+    private var liveSession:LiveSpeechSession?=null;private var liveGeneration=0
+    @Volatile private var cancelTake=false
+    private lateinit var liveText:TextView
     private var pending:PendingAudio?=null;private var target:String?=null;private var capture:AudioCapture?=null
     private var settingsDialog:AlertDialog?=null;private var testCapture:AudioCapture?=null;private var permissionAction:(()->Unit)?=null
     private lateinit var todoTab:Button;private lateinit var doneTab:Button;private lateinit var rows:LinearLayout;private lateinit var status:TextView
     private lateinit var setup:Button;private lateinit var draft:EditText;private lateinit var slot:FrameLayout;private lateinit var feedback:LinearLayout;private lateinit var level:LevelView;private lateinit var elapsed:TextView
+    private lateinit var snackbar:UndoSnackbar
+    private var swipeX=0f;private var swipeY=0f;private var swipeInDone=false
+    private var navigatingSwipe=false;private var verticalSwipe=false;private var multiTouchSwipe=false
     private lateinit var action:IconButton;private lateinit var cancel:Button;private lateinit var retryRow:LinearLayout
     private fun dp(n:Int)=(n*resources.displayMetrics.density).roundToInt()
     private fun bg(color:Int=Color.WHITE,radius:Int=12,stroke:Boolean=true)=GradientDrawable().apply{setColor(color);cornerRadius=dp(radius).toFloat();if(stroke)setStroke(dp(1),border)}
@@ -56,17 +62,21 @@ class MainActivity : Activity() {
         executor.execute{try{val present=speech.present();post{ready=present;render()}}catch(e:Throwable){error(e)}}
     }
     private fun buildUi(){
-        val root=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;setBackgroundColor(Color.WHITE)}
+        val root=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;setBackgroundColor(Color.WHITE);isClickable=true;importantForAccessibility=View.IMPORTANT_FOR_ACCESSIBILITY_NO}
         val tabs=LinearLayout(this).apply{setPadding(dp(12),dp(8),dp(12),dp(8))}
-        todoTab=button("TODO"){if(!capturing&&!finishing){done=false;render()}};doneTab=button("DONE"){if(!capturing&&!finishing){done=true;render()}}
+        todoTab=button("TODO"){switchScreen(false)};doneTab=button("DONE"){switchScreen(true)}
         tabs.addView(todoTab,LinearLayout.LayoutParams(0,dp(46),1f));tabs.addView(doneTab,LinearLayout.LayoutParams(0,dp(46),1f).apply{leftMargin=dp(10)})
         root.addView(tabs);root.addView(View(this).apply{setBackgroundColor(border)},LinearLayout.LayoutParams(-1,dp(1)))
         val scroll=ScrollView(this);val content=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;setPadding(dp(24),0,dp(24),dp(12))}
         rows=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL};content.addView(rows)
         setup=button("Download English voice model"){setupModel()};content.addView(setup);scroll.addView(content);root.addView(scroll,LinearLayout.LayoutParams(-1,0,1f))
         val bottom=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;setPadding(dp(18),dp(8),dp(18),dp(18))}
+        liveText=label("",16f).apply{
+            maxLines=5;visibility=View.GONE;isVerticalScrollBarEnabled=true
+            movementMethod=android.text.method.ScrollingMovementMethod.getInstance()
+        };bottom.addView(liveText)
         status=label("");status.visibility=View.GONE;bottom.addView(status)
-        cancel=button("Cancel"){if(capturing){finishing=true;capture?.stop(true);updateControls()}else if(transcribing){cancelTranscription=true;status.text="Cancelling… Recording kept for retry.";updateControls()}};cancel.visibility=View.GONE;bottom.addView(cancel,LinearLayout.LayoutParams(-2,dp(40)).apply{gravity=Gravity.END})
+        cancel=button("Cancel"){if(capturing){liveText.text="";status.visibility=View.GONE;cancelTake=true;liveGeneration++;liveSession?.cancel();liveSession=null;finishing=true;capture?.stop(true);updateControls()}else if(transcribing){cancelTranscription=true;liveSession?.cancel();status.text="Cancelling… Recording kept for retry.";updateControls()}};cancel.visibility=View.GONE;bottom.addView(cancel,LinearLayout.LayoutParams(-2,dp(40)).apply{gravity=Gravity.END})
         retryRow=LinearLayout(this).apply{gravity=Gravity.CENTER_VERTICAL}
         retryRow.addView(label("Saved recording"),LinearLayout.LayoutParams(0,-2,1f));retryRow.addView(button("Retry"){transcribe()});retryRow.addView(button("Discard"){pending=null;retry.clear();updateControls()});bottom.addView(retryRow)
         val controls=LinearLayout(this).apply{gravity=Gravity.CENTER_VERTICAL}
@@ -78,6 +88,7 @@ class MainActivity : Activity() {
         level=LevelView();feedback.addView(level,LinearLayout.LayoutParams(0,dp(20),1f));elapsed=label("0:00",11f);feedback.addView(elapsed);slot.addView(feedback,FrameLayout.LayoutParams(-1,dp(44)))
         controls.addView(slot,LinearLayout.LayoutParams(0,-2,1f).apply{leftMargin=dp(12);rightMargin=dp(12)})
         action=IconButton("mic","Record a note"){primaryAction()};controls.addView(action,LinearLayout.LayoutParams(dp(44),dp(44)))
+        snackbar=UndoSnackbar(this);bottom.addView(snackbar,LinearLayout.LayoutParams(-1,-2).apply{bottomMargin=dp(8)})
         bottom.addView(controls);root.addView(bottom)
         draft.addTextChangedListener(object:TextWatcher{override fun beforeTextChanged(s:CharSequence?,a:Int,c:Int,d:Int){};override fun onTextChanged(s:CharSequence?,a:Int,b:Int,c:Int){updateControls()};override fun afterTextChanged(s:Editable?){} })
         setContentView(root)
@@ -90,18 +101,64 @@ class MainActivity : Activity() {
             val row=LinearLayout(this).apply{gravity=Gravity.CENTER_VERTICAL;minimumHeight=dp(66)}
             val text=label(n.text,17f);row.addView(text,LinearLayout.LayoutParams(0,-2,1f))
             val menu=button("···"){noteMenu(n)};menu.contentDescription="Actions for ${n.text.take(50)}";row.addView(menu,LinearLayout.LayoutParams(dp(38),dp(44)))
-            row.setOnClickListener{noteMenu(n)}
-            var x=0f;var y=0f;var horizontal=false
-            row.setOnTouchListener{v,event -> when(event.actionMasked){
-                MotionEvent.ACTION_DOWN->{x=event.rawX;y=event.rawY;horizontal=false;true}
-                MotionEvent.ACTION_MOVE->{val dx=event.rawX-x;if(abs(dx)>dp(12)&&abs(dx)>abs(event.rawY-y)*1.3)horizontal=true;if(horizontal){v.parent.requestDisallowInterceptTouchEvent(true);v.translationX=dx.coerceIn(-dp(120).toFloat(),dp(120).toFloat())};true}
-                MotionEvent.ACTION_UP->{val dx=event.rawX-x;v.translationX=0f;if(horizontal&&abs(dx)>dp(80)){if(dx>0){if(done)erase(n)else move(n,true)}else{if(done)move(n,false)else chooseEdit(n)}}else if(!horizontal)v.performClick();true}
-                MotionEvent.ACTION_CANCEL->{v.translationX=0f;true};else->false}}
+            // Only TODO's right swipe completes an item. Left swipes and all DONE swipes
+            // are handled by Activity.dispatchTouchEvent, including gestures on empty space.
+            if(!done){
+                var x=0f;var y=0f;var horizontal=false;var blocked=false
+                row.setOnTouchListener{v,event -> when(event.actionMasked){
+                    MotionEvent.ACTION_DOWN->{x=event.rawX;y=event.rawY;horizontal=false;blocked=false;true}
+                    MotionEvent.ACTION_MOVE->{val dx=event.rawX-x;val dy=event.rawY-y
+                        if(!horizontal&&abs(dy)>dp(12)&&abs(dy)*1.3f>=abs(dx))blocked=true
+                        if(!blocked&&dx>dp(12)&&dx>abs(dy)*1.3f)horizontal=true
+                        if(horizontal){v.parent.requestDisallowInterceptTouchEvent(true);v.translationX=dx.coerceIn(0f,dp(120).toFloat())};true}
+                    MotionEvent.ACTION_UP->{val complete=!blocked&&completesNote(done,event.rawX-x,event.rawY-y,dp(80).toFloat());v.translationX=0f;if(complete)move(n,true);true}
+                    MotionEvent.ACTION_POINTER_DOWN->{blocked=true;horizontal=false;v.translationX=0f;true}
+                    MotionEvent.ACTION_CANCEL->{v.translationX=0f;horizontal=false;blocked=true;true};else->false}
+                }
+            }
             rows.addView(row);rows.addView(View(this).apply{setBackgroundColor(border)},LinearLayout.LayoutParams(-1,dp(1)))
         };setup.visibility=if(!ready&&!done)View.VISIBLE else View.GONE;updateControls()
     }
+    private fun switchScreen(showDone:Boolean){
+        if(capturing||finishing||done==showDone)return
+        done=showDone
+        if(done){(getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(draft.windowToken,0);draft.clearFocus()}
+        render()
+    }
+    private fun cancelChildTouch(event:MotionEvent){
+        val cancelEvent=MotionEvent.obtain(event);cancelEvent.action=MotionEvent.ACTION_CANCEL
+        try{super.dispatchTouchEvent(cancelEvent)}finally{cancelEvent.recycle()}
+    }
+    override fun dispatchTouchEvent(event:MotionEvent):Boolean{
+        // Dialogs receive their own Window events, so settings sliders and edit fields retain
+        // their normal gestures. This observer covers every part of the main screen.
+        when(event.actionMasked){
+            MotionEvent.ACTION_DOWN->{swipeX=event.rawX;swipeY=event.rawY;swipeInDone=done;navigatingSwipe=false;verticalSwipe=false;multiTouchSwipe=false}
+            MotionEvent.ACTION_POINTER_DOWN->{multiTouchSwipe=true;if(navigatingSwipe)cancelChildTouch(event)}
+            MotionEvent.ACTION_MOVE->{
+                if(!multiTouchSwipe&&!verticalSwipe&&!capturing&&!finishing){
+                    val dx=event.rawX-swipeX;val dy=event.rawY-swipeY
+                    if(!navigatingSwipe&&abs(dy)>dp(12)&&abs(dy)*1.3f>=abs(dx))verticalSwipe=true
+                    else if(!navigatingSwipe&&screenSwipe(swipeInDone,dx,dy,dp(12).toFloat())!=ScreenSwipe.NONE){navigatingSwipe=true;cancelChildTouch(event)}
+                }
+                if(navigatingSwipe)return true
+            }
+            MotionEvent.ACTION_UP->{
+                val destination=if(!multiTouchSwipe&&!verticalSwipe&&!capturing&&!finishing)screenSwipe(swipeInDone,event.rawX-swipeX,event.rawY-swipeY,dp(80).toFloat())else ScreenSwipe.NONE
+                if(navigatingSwipe||destination!=ScreenSwipe.NONE){
+                    if(!navigatingSwipe)cancelChildTouch(event)
+                    navigatingSwipe=false
+                    if(destination!=ScreenSwipe.NONE)switchScreen(destination==ScreenSwipe.DONE)
+                    return true
+                }
+            }
+            MotionEvent.ACTION_CANCEL->{val consumed=navigatingSwipe;navigatingSwipe=false;multiTouchSwipe=false;if(consumed)return true}
+        }
+        return super.dispatchTouchEvent(event)
+    }
     private fun updateControls(){
         if(!::draft.isInitialized||!::action.isInitialized)return
+        liveText.visibility=if((capturing||finishing||transcribing)&&liveText.text.isNotBlank())View.VISIBLE else View.GONE
         draft.visibility=if(capturing||done)View.GONE else View.VISIBLE;draft.isEnabled=!finishing
         feedback.visibility=if(capturing)View.VISIBLE else View.GONE;slot.visibility=if(done)View.INVISIBLE else View.VISIBLE
         cancel.visibility=if(capturing||transcribing)View.VISIBLE else View.GONE;cancel.isEnabled=!finishing&&!cancelTranscription
@@ -113,7 +170,7 @@ class MainActivity : Activity() {
     }
     private fun primaryAction(){
         try{
-            if(done){AlertDialog.Builder(this).setTitle("Empty DONE?").setMessage("All done notes will be erased permanently.").setNegativeButton("Cancel",null).setPositiveButton("Erase all"){_,_->store.emptyDone();render()}.show();return}
+            if(done){AlertDialog.Builder(this).setTitle("Empty DONE?").setMessage("All done notes will be erased permanently.").setNegativeButton("Cancel",null).setPositiveButton("Erase all"){_,_->snackbar.dismiss();store.emptyDone();render()}.show();return}
             if(capturing){finishing=true;capture?.stop();updateControls();return}
             val text=draft.text.toString().trim();if(text.isNotBlank()){store.add(text);draft.setText("");render();return}
             startRecording(null)
@@ -121,9 +178,15 @@ class MainActivity : Activity() {
     }
     private fun noteMenu(n:Note){AlertDialog.Builder(this).setItems(if(done)arrayOf("Restore","Erase forever")else arrayOf("Edit","Done")){_,i->if(done){if(i==0)move(n,false)else erase(n)}else{if(i==0)chooseEdit(n)else move(n,true)}}.show()}
     private fun move(n:Note,deleted:Boolean){try{store.save(n.copy(created=if(deleted)n.created else System.currentTimeMillis(),deleted=if(deleted)System.currentTimeMillis()else null));render()
-        val undo=AlertDialog.Builder(this).setMessage(if(deleted)"Moved to DONE" else "Restored to TODO").setPositiveButton("Undo"){_,_->store.save(n);render()}.create();undo.show();ui.postDelayed({if(undo.isShowing)undo.dismiss()},2500)
+        snackbar.show(if(deleted)"Moved to DONE" else "Restored to TODO"){
+            try{
+                // Preserve any subsequent text edit and never resurrect a permanently erased item.
+                store.all().find{it.id==n.id}?.let{current->store.save(current.copy(created=n.created,deleted=n.deleted))}
+                render()
+            }catch(e:Throwable){error(e)}
+        }
     }catch(e:Throwable){error(e)}}
-    private fun erase(n:Note){AlertDialog.Builder(this).setTitle("Erase this note forever?").setMessage("This cannot be undone.").setNegativeButton("Cancel",null).setPositiveButton("Erase"){_,_->store.erase(n.id);render()}.show()}
+    private fun erase(n:Note){AlertDialog.Builder(this).setTitle("Erase this note forever?").setMessage("This cannot be undone.").setNegativeButton("Cancel",null).setPositiveButton("Erase"){_,_->snackbar.dismiss();store.erase(n.id);render()}.show()}
     private fun chooseEdit(n:Note){if(capturing||busy||finishing)return;AlertDialog.Builder(this).setTitle("Edit note").setItems(arrayOf("Type","Record")){_,i->if(i==0)edit(n,n.text,false)else startRecording(n.id)}.setNegativeButton("Cancel",null).show()}
     private fun edit(n:Note,text:String,recorded:Boolean){
         val input=EditText(this).apply{setText(text);setSelection(text.length);minLines=3;filters=arrayOf(InputFilter.LengthFilter(20000));setPadding(dp(20),dp(10),dp(20),dp(10))}
@@ -142,30 +205,76 @@ class MainActivity : Activity() {
         permission{beginCapture(id)}
     }
     private fun beginCapture(id:String?){
-        if(busy||capturing)return;target=id;val current=AudioCapture();capture=current
+        if(busy||capturing)return
+        target=id;cancelTake=false;cancelTranscription=false
+        val generation=++liveGeneration
+        liveText.text="";liveText.scrollTo(0,0)
+        val session=LiveSpeechSession(executor,object:LiveSpeech{
+            override fun start(onText:(String)->Unit)=speech.startLive(onText)
+            override fun feed(audio:FloatArray)=speech.feedLive(audio)
+            override fun finish()=speech.finishLive()
+            override fun abort()=speech.abortLive()
+        },onText={text->post{
+            if(generation==liveGeneration&&!cancelTranscription&&(capturing||finishing||transcribing)){
+                liveText.text=text;updateControls()
+                liveText.post{liveText.layout?.let{layout->liveText.scrollTo(0,maxOf(0,layout.height-liveText.height+liveText.totalPaddingTop+liveText.totalPaddingBottom))}}
+            }
+        }},onError={e->post{
+            if(generation==liveGeneration&&capturing){status.text="Live text paused: ${e.message}. Audio is still being recorded.";status.visibility=View.VISIBLE}
+        }})
+        liveSession=session
+        val current=AudioCapture();capture=current
         try{
-            current.start(false,silence,threshold,onLevel={rms,seconds,_->post{level.value=EnergyVad.level(rms);elapsed.text=String.format(Locale.US,"%d:%02d",seconds.toInt()/60,seconds.toInt()%60)}},onDone={audio,usable,_->
-                var saved:PendingAudio?=null;var saveError:Throwable?=null
-                if(audio!=null&&usable)try{saved=PendingAudio(audio,id);retry.save(saved)}catch(e:Throwable){saveError=e}
-                post{
-                    capturing=false;finishing=false;capture=null;updateControls()
-                    if(saveError!=null)error(saveError!!)
-                    else if(saved!=null){pending=saved;transcribe()}
-                    else if(audio!=null){status.text="No speech detected. Adjust sensitivity in Settings.";status.visibility=View.VISIBLE}
-                }
-            },onError={e->post{capturing=false;finishing=false;capture=null;error(e)}})
+            current.start(false,silence,threshold,
+                onLevel={rms,seconds,_->post{level.value=EnergyVad.level(rms);elapsed.text=String.format(Locale.US,"%d:%02d",seconds.toInt()/60,seconds.toInt()%60)}},
+                onAudio={audio->session.offer(audio)},
+                onDone={audio,usable,_->
+                    var saved:PendingAudio?=null;var saveError:Throwable?=null
+                    if(audio!=null&&usable&&!cancelTake)try{saved=PendingAudio(audio,id);retry.save(saved)}catch(e:Throwable){saveError=e}
+                    if(audio==null||!usable||saveError!=null||cancelTake)session.cancel()
+                    post{
+                        capturing=false;finishing=false;capture=null
+                        when {
+                            cancelTake->{if(saved!=null)retry.clear();liveSession=null;liveText.text="";updateControls()}
+                            saveError!=null->{liveSession=null;liveText.text="";error(saveError!!)}
+                            saved!=null->{pending=saved;finishLiveTake(session,generation)}
+                            else->{liveSession=null;liveText.text="";updateControls();if(audio!=null){status.text="No speech detected. Adjust sensitivity in Settings.";status.visibility=View.VISIBLE}}
+                        }
+                    }
+                },
+                onError={e->session.cancel();post{liveGeneration++;liveSession=null;capturing=false;finishing=false;capture=null;liveText.text="";error(e)}}
+            )
             capturing=true;elapsed.text="0:00";level.value=0f;status.visibility=View.GONE
             (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(draft.windowToken,0);draft.clearFocus();updateControls()
-        }catch(e:Throwable){capture=null;error(e)}
+        }catch(e:Throwable){session.cancel();liveGeneration++;liveSession=null;capture=null;error(e)}
+    }
+    private fun finishLiveTake(session:LiveSpeechSession,generation:Int){
+        val p=pending?:return
+        busy=true;transcribing=true;status.text="Finishing transcription…";status.visibility=View.VISIBLE;updateControls()
+        session.finish{result->post{
+            if(generation!=liveGeneration)return@post
+            liveSession=null
+            when {
+                cancelTranscription->completeTranscript(p,"")
+                result.isSuccess->completeTranscript(p,result.getOrThrow())
+                else->{busy=false;transcribing=false;transcribe()} // Durable PCM remains available if the stream failed.
+            }
+        }}
+    }
+    private fun completeTranscript(p:PendingAudio,text:String){
+        try{
+            if(cancelTranscription){status.text="Transcription cancelled. Recording kept for retry.";return}
+            if(p.target==null){val now=System.currentTimeMillis();store.save(Note(p.id,text,now,now,null))}
+            else{val n=store.all().find{it.id==p.target}?:error("The note no longer exists");edit(n,text,true)}
+            retry.clear();pending=null;status.visibility=View.GONE
+        }catch(e:Throwable){error(e)}finally{busy=false;transcribing=false;finishing=false;liveText.text="";render()}
     }
     private fun setupModel(){if(busy)return;busy=true;status.text="Downloading English model…";status.visibility=View.VISIBLE;updateControls()
         executor.execute{try{speech.setup{message->post{status.text=message}};post{ready=true;busy=false;status.visibility=View.GONE;render()}}catch(e:Throwable){post{busy=false;error(e);render()}}}}
     private fun transcribe(){
         val p=pending?:return;if(busy)return;busy=true;transcribing=true;cancelTranscription=false;status.text="Transcribing…";status.visibility=View.VISIBLE;updateControls()
-        executor.execute{try{val text=speech.transcribe(p.audio){message->post{if(!cancelTranscription)status.text=message}};post{
-            try{if(cancelTranscription){status.text="Transcription cancelled. Recording kept for retry.";return@post};if(p.target==null){val now=System.currentTimeMillis();store.save(Note(p.id,text,now,now,null))}else{val n=store.all().find{it.id==p.target}?:error("The note no longer exists");edit(n,text,true)};retry.clear();pending=null;status.visibility=View.GONE}
-            catch(e:Throwable){error(e)}finally{busy=false;transcribing=false;render()}
-        }}catch(e:Throwable){post{busy=false;transcribing=false;error(e);updateControls()}}}
+        executor.execute{try{val text=speech.transcribe(p.audio){message->post{if(!cancelTranscription)status.text=message}};post{completeTranscript(p,text)}}
+            catch(e:Throwable){post{busy=false;transcribing=false;liveText.text="";error(e);updateControls()}}}
     }
     private fun stopTest(){testCapture?.stop(true);testCapture=null}
     private fun openSettings(){
@@ -187,7 +296,7 @@ class MainActivity : Activity() {
         };panel.addView(test)
         panel.addView(button(if(ready)"Check voice model" else "Download voice model"){settingsDialog?.dismiss();setupModel()})
         panel.addView(button("Export backup"){exportBackup()});panel.addView(button("Import backup"){importBackup()})
-        panel.addView(label("VNotes 3.0 · native Kotlin\nEnglish Moonshine Tiny · local processing",12f))
+        panel.addView(label("VNotes 3.2 · native Kotlin\nEnglish Moonshine Tiny · local processing",12f))
         val scroll=ScrollView(this).apply{addView(panel)}
         settingsDialog=AlertDialog.Builder(this).setTitle("Settings").setView(scroll).setPositiveButton("Done",null).create().also{d->d.setOnDismissListener{stopTest();permissionAction=null;settingsDialog=null};d.show()}
     }
@@ -201,8 +310,8 @@ class MainActivity : Activity() {
             AlertDialog.Builder(this).setTitle("Import $count notes?").setMessage("Existing notes and settings will be preserved.").setNegativeButton("Cancel",null).setPositiveButton("Import"){_,_->try{store.merge(notes);render()}catch(e:Throwable){error(e)}}.show()
         }}catch(e:Throwable){error(e)}
     }
-    override fun onStop(){super.onStop();stopTest();settingsDialog?.dismiss();permissionAction=null;if(capturing){finishing=true;capture?.stop(false,"background");updateControls()}}
-    override fun onDestroy(){capture?.stop(true);stopTest();executor.execute{speech.close()};executor.shutdown();super.onDestroy()}
+    override fun onStop(){super.onStop();snackbar.dismiss();stopTest();settingsDialog?.dismiss();permissionAction=null;if(capturing){finishing=true;capture?.stop(false,"background");updateControls()}}
+    override fun onDestroy(){capture?.stop(true);liveGeneration++;liveSession?.cancel();stopTest();executor.execute{speech.close()};executor.shutdown();super.onDestroy()}
 
     private inner class LevelView:View(this@MainActivity){
         var value=0f;set(v){field=v;invalidate();contentDescription="Microphone level ${(v*100).toInt()} percent"}

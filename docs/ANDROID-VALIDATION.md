@@ -1,6 +1,25 @@
 # Native Android validation
 
-Build: VNotes 3.0.0 (version code 1), package app.vnotes.
+Latest build: VNotes 3.2.0 (version code 3), package app.vnotes.
+
+## 3.2 live transcription — 2026-11-07
+
+- Final `assembleDebug testDebugUnitTest lintDebug` passed. All 16 JVM tests pass: previous VAD/swipe cases plus six live-session regressions. No lint errors.
+- Tests verify partial text arrives before Stop, immutable audio ownership, ordered feeding/final flushing, cancellation skipping queued recognition, suppression of late events, recoverable stream failures, bounded input and line-ID-based revision without duplicate words. Tests use a deterministic fake backend; they do not execute the Android JNI speech engine.
+- Integrated the pinned Moonshine 0.1.5 start/addAudio/stop stream API. Explicitly enable decode_incomplete_lines=true, verified as a supported key in the shipped native binary and against the native core path. Reuse the existing Tiny model and model directory; no migration/download is introduced.
+- Final APK v2 signature verified; certificate matches the previous installed-version APK. Package app.vnotes, 3.2.0/code 3. Zip alignment verified and release checksum updated.
+- No physical Android/emulator live-speech test was performed. On the phone, verify words appear while continuing to speak, hypotheses revise without duplication, pauses shorter than the configured silence duration remain one note, manual/silence Stop retains the final phrase, Cancel leaves no note/preview, recorded edits remain unchanged until Save, repeated takes do not show stale text, and airplane-mode operation still works. Check responsiveness and memory on long takes and weak CPUs.
+- Stream errors preserve raw PCM and fall back to existing saved-audio recognition. Recording cancellation clears the live preview immediately; finalization cancellation retains retry audio. Buffered retry-file output avoids per-float disk writes without changing its format.
+
+## 3.1 gesture and snackbar update — 2026-11-05
+
+- `assembleDebug testDebugUnitTest lintDebug` passed. All 10 JVM tests pass: five existing VAD/splitting tests plus five navigation regressions covering left TODO -> DONE, right DONE -> TODO, right TODO item -> completion, no left-DONE destruction, and rejection of vertical/short gestures. Lint reports no errors.
+- Snackbar is a non-modal horizontal bar immediately above the composer, message on left and UNDO on right, with accessible timeout handling. No move AlertDialog remains. Undo retains later text edits and cannot resurrect erased records.
+- Activity dispatch handles navigation on the whole main screen, including blank space and controls; child gestures are cancelled when navigating. Settings/edit dialogs retain their own gestures. Editing is only reachable from the ellipsis menu; row-body taps do not open it. Permanent deletion has no swipe entry point.
+- Package metadata verified as 3.1.0/code 2, minimum SDK 26. APK v2 signature and zip alignment verified; signing certificate matches the previous 3.0.0 release, allowing in-place installation without clearing data or model files. Checksum updated.
+- No phone/emulator UI test was performed for this update. On-device verify snackbar placement with keyboard open, UNDO, swipes starting on rows/blank space/composer/tabs, vertical scrolling, ellipsis edit, and explicit erase controls. Recording/finishing still blocks navigation.
+
+The following baseline checks were completed for 3.0.0:
 
 ## Completed
 

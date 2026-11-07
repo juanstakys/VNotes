@@ -6,8 +6,8 @@ android {
         applicationId = "app.vnotes"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "3.0.0"
+        versionCode = 3
+        versionName = "3.2.0"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
     }
     signingConfigs { getByName("debug") { storeFile = rootProject.file(".signing/debug.keystore") } }

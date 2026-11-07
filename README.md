@@ -16,15 +16,18 @@ No localhost server, USB port forwarding or browser is required. Start VNotes, t
 
 The Kotlin app uses native Android `AudioRecord` and native Moonshine Tiny, not WebView or browser speech APIs. Its model files differ from the PWA and need their own one-time download.
 
+The 3.2 update installs over the previous APK and preserves notes, settings and downloaded model files.
+
 ## Data and behavior
 
 - TODO/DONE tabs, plain note rows, settings at bottom left, shared record/stop/send button at bottom right.
-- During recording, the text box becomes a microphone level bar and timer. Separate Cancel discards recording.
+- During recording, the text box becomes a microphone level bar and timer. A live transcript appears above it and revises as you speak. Stop or silence detection flushes the final phrase and saves one note; recorded edits still require review. Separate Cancel discards the recording and preview.
 - Energy VAD: 300ms minimum sound, configurable silence interval, up to 2-minute capture, logarithmic sensitivity slider and a settings microphone test.
-- Swipe right to mark done; swipe left to edit. In DONE: right erases after confirmation, left restores. Tap a row or its menu for the same actions.
+- Swipe left anywhere on the main screen to open DONE; swipe right in DONE to return to TODO. Right-swiping a TODO item still marks it done. Edit only through the item’s **··· → Edit** menu. Restore and individual permanent deletion are in the DONE item menu; the trash button erases all done notes after confirmation.
+- Moves show a non-modal snackbar immediately above the input, with **UNDO** on the right.
 - Settings exports/imports JSON backups via Android's document picker. Import the PWA's JSON backup to transfer existing notes; the app cannot access browser IndexedDB automatically. Existing matching IDs remain unchanged.
 - Notes are stored in private SQLite. Failed recording audio stays in private storage for Retry/Discard. Uninstalling clears app data; export a backup before uninstalling.
-- Microphone capture stops when the app leaves the foreground. No background recording service or audio uploads. Transcription runs on a single background executor; cancellation preserves retry audio and takes effect after the running transcription operation finishes.
+- Microphone capture stops when the app leaves the foreground. No background recording service or audio uploads. Live recognition runs on a single background executor and reuses the existing English Tiny model, with no new download required. Update speed depends on phone CPU. Cancelling skips queued recognition and waits for an active native call to return; cancelled finalization retains retry audio. Failed live streams fall back to transcription from the saved audio.
 
 ## Repository
 

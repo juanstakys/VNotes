@@ -49,7 +49,7 @@ class RetryStore(context: Context) {
     private val file=AtomicFile(File(context.filesDir,"pending-audio.bin"))
     fun save(pending: PendingAudio) {
         val stream=file.startWrite()
-        try {val out=DataOutputStream(stream);out.writeInt(0x564E4131);out.writeUTF(pending.id);out.writeUTF(pending.target ?: "");out.writeInt(pending.audio.size);pending.audio.forEach{out.writeFloat(it)};out.flush();file.finishWrite(stream)}
+        try {val out=DataOutputStream(BufferedOutputStream(stream));out.writeInt(0x564E4131);out.writeUTF(pending.id);out.writeUTF(pending.target ?: "");out.writeInt(pending.audio.size);pending.audio.forEach{out.writeFloat(it)};out.flush();file.finishWrite(stream)}
         catch(e:Throwable){file.failWrite(stream);throw e}
     }
     fun load(): PendingAudio? {

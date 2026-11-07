@@ -18,7 +18,8 @@ class AudioCapture {
     @SuppressLint("MissingPermission")
     fun start(test: Boolean, silence: Double, threshold: Double,
               onLevel: (Double, Double, Double) -> Unit,
-              onDone: (FloatArray?, Boolean, String) -> Unit, onError: (Throwable) -> Unit) {
+              onDone: (FloatArray?, Boolean, String) -> Unit, onError: (Throwable) -> Unit,
+              onAudio: (FloatArray) -> Unit = {}) {
         check(!running.get()) { "Microphone is already running" }
         val minimum = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
         check(minimum > 0) { "16 kHz microphone input is unavailable ($minimum)" }
@@ -38,11 +39,13 @@ class AudioCapture {
                     val count = input.read(block, 0, block.size, AudioRecord.READ_BLOCKING)
                     if (!running.get()) break
                     check(count > 0) { "Microphone read failed ($count). Check Android microphone access." }
+                    val previousSize = size
                     var energy = 0.0
                     for (i in 0 until count) {
                         val value = block[i] / 32768f; energy += value * value
                         if (pcm != null && size < pcm.size) pcm[size++] = value
                     }
+                    if (!test && size > previousSize) onAudio(pcm!!.copyOfRange(previousSize, size))
                     val rms = sqrt(energy / count); val autoStop = vad.push(rms, count)
                     onLevel(rms, vad.totalMs / 1000, vad.quietMs / 1000)
                     if (!test && (autoStop || size == pcm!!.size)) { reason = if (autoStop) "silence" else "limit"; running.set(false) }
