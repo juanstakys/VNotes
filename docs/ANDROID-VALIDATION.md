@@ -1,6 +1,16 @@
 # Native Android validation
 
-Latest build: VNotes 3.2.0 (version code 3), package app.vnotes.
+Latest build: VNotes 3.3.0 (version code 4), package app.vnotes.
+
+## 3.3 bottom-up lists and selectable design — 2026-11-07
+
+- Final `assembleDebug testDebugUnitTest lintDebug` passed. All 19 tests pass, zero failures/errors: 16 existing VAD/swipe/live-session regressions and three native UI tests. Lint reports no errors.
+- Robolectric/API28 exercises real theme resources and native Activity views. Verified Original remains default, short content measures at the bottom of a fill-viewport scroll area, and adding notes retains newest-first order. Verified Material segmented tabs, card rows, FABs, outlined text inputs, settings switch/slider/dropdown and dialog construction.
+- The toggle test uses Android's actual Activity recreation path, checks the persisted preference, then verifies the new Material screen retains an unsent draft and DONE selection. SQLite connections close when an old Activity is destroyed. Design changes are blocked during speech/model operations.
+- TextInputLayout children use LinearLayout.LayoutParams and its themed context; the tests caught and prevented a runtime field-construction failure before release. Material snackbar uses the library component anchored above composer controls; Original retains its existing bar. This snackbar behavior has not been exercised on hardware in this update.
+- Final APK v2 signature and 16KB-aware zip alignment verified. Package app.vnotes, version 3.3.0/code 4, minimum API26. Signing certificate matches the previous release, allowing in-place updates without clearing notes/settings/model files. Deliverable and SHA-256 updated in releases/.
+- No phone/emulator run was performed. On-device check both designs with short/overflowing TODO and DONE lists, new text/voice additions, scrolling, keyboard open, large font sizes, gestures, menus, edit/review dialogs, undo placement/action, recording feedback and model setup. Toggle both directions and relaunch to check persistence. Native microphone/transcription behavior is unchanged and still requires device testing.
+- Reconstruction guide documents viewport anchoring, Material component selection, shared behavior, palette resources, saved preference and recreation state. PWA files remain unchanged.
 
 ## 3.2 live transcription — 2026-11-07
 

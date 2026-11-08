@@ -14,7 +14,8 @@ import android.widget.LinearLayout
 import android.widget.TextView
 
 /** Non-modal snackbar, placed immediately above the composer (and therefore above the IME). */
-class UndoSnackbar(context: Context) : LinearLayout(context) {
+class UndoSnackbar(context: Context, private val material3: Boolean = false, private val anchor: View? = null) : LinearLayout(context) {
+    private var materialBar: com.google.android.material.snackbar.Snackbar? = null
     private val handler = Handler(Looper.getMainLooper())
     private var undoAction: (() -> Unit)? = null
     private val timeout = Runnable { dismiss() }
@@ -37,13 +38,27 @@ class UndoSnackbar(context: Context) : LinearLayout(context) {
         visibility = GONE
     }
     fun show(text: String, action: () -> Unit) {
-        handler.removeCallbacks(timeout); undoAction = action; message.text = text; visibility = VISIBLE
+        dismiss()
+        if (material3) {
+            val bar = com.google.android.material.snackbar.Snackbar.make(anchor ?: this, text, 6000)
+            materialBar = bar
+            anchor?.let { bar.setAnchorView(it) }
+            bar.setAction("UNDO") { action() }
+            bar.addCallback(object : com.google.android.material.snackbar.Snackbar.Callback() {
+                override fun onDismissed(snackbar: com.google.android.material.snackbar.Snackbar?, event: Int) {
+                    if (materialBar === snackbar) materialBar = null
+                }
+            })
+            bar.show()
+            return
+        }
+        undoAction = action; message.text = text; visibility = VISIBLE
         val accessibility = context.getSystemService(Context.ACCESSIBILITY_SERVICE) as AccessibilityManager
         val delay = if (Build.VERSION.SDK_INT >= 29) accessibility.getRecommendedTimeoutMillis(
             6000, AccessibilityManager.FLAG_CONTENT_TEXT or AccessibilityManager.FLAG_CONTENT_CONTROLS
         ).toLong() else if (accessibility.isTouchExplorationEnabled) 15000L else 6000L
         handler.postDelayed(timeout, delay)
     }
-    fun dismiss() { handler.removeCallbacks(timeout); undoAction = null; visibility = GONE }
+    fun dismiss() { handler.removeCallbacks(timeout); undoAction = null; visibility = GONE; val bar = materialBar; materialBar = null; bar?.dismiss() }
     override fun onDetachedFromWindow() { dismiss(); super.onDetachedFromWindow() }
 }
