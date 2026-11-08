@@ -97,4 +97,61 @@ class DesignUiTest {
         assertEquals("Unsent draft", views(restored).filterIsInstance<EditText>().single().text.toString())
         assertTrue(views(restored).any { it.contentDescription == "Erase all done notes" })
     }
+    @Test fun completionSwipeMovesCardAndCancellationResetsIt() {
+        val activity = start(material = true)
+        add(activity, "Swipe this card")
+        val root = activity.findViewById<ViewGroup>(android.R.id.content)
+        root.measure(View.MeasureSpec.makeMeasureSpec(360, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(720, View.MeasureSpec.EXACTLY))
+        root.layout(0, 0, 360, 720)
+        val card = views(activity).filterIsInstance<MaterialCardView>().single()
+        val row = card.getChildAt(0)
+        val distance = 100f * activity.resources.displayMetrics.density
+        fun touch(action: Int, x: Float) {
+            val event = android.view.MotionEvent.obtain(0, 10, action, x, 20f, 0)
+            try { row.dispatchTouchEvent(event) } finally { event.recycle() }
+        }
+        touch(android.view.MotionEvent.ACTION_DOWN, 10f)
+        touch(android.view.MotionEvent.ACTION_MOVE, 10f + distance)
+        assertTrue("The outer card must follow the finger", card.translationX > 0f)
+        assertEquals("Text and menu stay inside the moving card", 0f, row.translationX, .01f)
+        touch(android.view.MotionEvent.ACTION_CANCEL, 10f + distance)
+        assertEquals(0f, card.translationX, .01f)
+        touch(android.view.MotionEvent.ACTION_DOWN, 10f)
+        touch(android.view.MotionEvent.ACTION_MOVE, 10f + distance)
+        touch(android.view.MotionEvent.ACTION_UP, 10f + distance)
+        val store = NoteStore(context)
+        try { assertNotNull(store.all().single().deleted) } finally { store.close() }
+        assertTrue(views(activity).none { it is MaterialCardView })
+    }
+    @Test fun tabSlidesInBothDirectionsAndRapidReversalLeavesOnePage() {
+        for (material in listOf(false, true)) {
+            val store = NoteStore(context)
+            try {
+                store.writableDatabase.delete("notes", null, null)
+                store.save(Note("todo", "Active page", 1, 1, null))
+                store.save(Note("done", "Completed page", 2, 2, 3))
+            } finally { store.close() }
+            val activity = start(material)
+            val root = activity.findViewById<ViewGroup>(android.R.id.content)
+            root.measure(View.MeasureSpec.makeMeasureSpec(360, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(720, View.MeasureSpec.EXACTLY))
+            root.layout(0, 0, 360, 720)
+            fun tab(name: String) = views(activity).filterIsInstance<Button>().single { it.text == name }
+            tab("DONE").performClick()
+            var pages = views(activity).filterIsInstance<ScrollView>()
+            assertEquals(2, pages.size)
+            assertTrue("DONE enters from the right", pages.last().translationX > 0f)
+            tab("TODO").performClick()
+            pages = views(activity).filterIsInstance<ScrollView>()
+            assertEquals("Reversal must discard the stale outgoing page", 2, pages.size)
+            assertTrue("TODO enters from the left", pages.last().translationX < 0f)
+            org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(500))
+            pages = views(activity).filterIsInstance<ScrollView>()
+            assertEquals(1, pages.size)
+            assertEquals(0f, pages.single().translationX, .01f)
+            assertTrue(views(activity).filterIsInstance<TextView>().any { it.text == "Active page" })
+            assertFalse(views(activity).filterIsInstance<TextView>().any { it.text == "Completed page" })
+            controller!!.pause().stop().destroy(); controller = null
+        }
+    }
+
 }

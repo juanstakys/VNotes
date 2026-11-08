@@ -1,6 +1,15 @@
 # Native Android validation
 
-Latest build: VNotes 3.3.0 (version code 4), package app.vnotes.
+Latest build: VNotes 3.3.1 (version code 5), package app.vnotes.
+
+## 3.3.1 sliding tabs and whole-card swipe — 2026-11-07
+
+- Final `assembleDebug testDebugUnitTest lintDebug` passed. All 21 tests pass with zero failures/errors: 16 signal/navigation/live-session tests and five native UI tests. Lint reports no errors.
+- New UI regressions verify the outer Material card follows a completion drag while its inner row stays at translation zero; cancellation returns the card to its original position, and releasing a qualifying swipe moves the note to DONE.
+- Tested both designs with TODO -> DONE entering from the right and reverse navigation entering from the left. Rapid reversal discards the stale outgoing page, and after animation exactly one page remains at translation zero. Existing design-switch/draft/tab restoration tests still pass.
+- Transitions use two real scroll pages in a clipped host, 220ms deceleration, fixed top/bottom controls, stale-callback generation protection, cleanup on background and no animation when disabled by Android or before layout. Activity swipe navigation and tab taps share this path. Outgoing pages cannot receive note touches during a slide.
+- Final APK v2 signature verified, same certificate as 3.3.0; 16KB-aware zip alignment passed. Manifest verified app.vnotes, 3.3.1/code 5, minimum API26. Updated releases APK and SHA-256. Notes/model/audio storage formats are unchanged.
+- No physical phone/emulator run was performed. On-device verify animation smoothness, both tap/swipe navigation directions, rapid reversal, keyboard-open transitions, scrolling versus horizontal gestures, complete-card drag/cancel/complete and undo in both designs. Native microphone/transcription code is unchanged.
 
 ## 3.3 bottom-up lists and selectable design — 2026-11-07
 

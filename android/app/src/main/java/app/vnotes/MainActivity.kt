@@ -1,5 +1,7 @@
 package app.vnotes
 
+import android.animation.ValueAnimator
+import android.view.animation.DecelerateInterpolator
 import android.Manifest
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AlertDialog
@@ -47,6 +49,8 @@ class MainActivity : AppCompatActivity() {
     private var material3=false;private var reopenSettings=false;private var updatingTabs=false
     private var tabGroup:MaterialButtonToggleGroup?=null
     private lateinit var draftBox:View;private lateinit var notesScroll:ScrollView
+    private lateinit var notesHost:NotesHost
+    private var tabAnimating=false;private var tabAnimationGeneration=0
     private val ui=Handler(Looper.getMainLooper());private val executor=Executors.newSingleThreadExecutor()
     private lateinit var store:NoteStore;private lateinit var retry:RetryStore;private lateinit var speech:SpeechEngine
     private val prefs by lazy{getSharedPreferences("settings",MODE_PRIVATE)}
@@ -129,10 +133,9 @@ class MainActivity : AppCompatActivity() {
             tabs.addView(todoTab,LinearLayout.LayoutParams(0,dp(46),1f));tabs.addView(doneTab,LinearLayout.LayoutParams(0,dp(46),1f).apply{leftMargin=dp(10)})
             root.addView(tabs);root.addView(View(this).apply{setBackgroundColor(border)},LinearLayout.LayoutParams(-1,dp(1)))
         }
-        val scroll=ScrollView(this).apply{isFillViewport=true};notesScroll=scroll
-        val content=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;gravity=Gravity.BOTTOM;setPadding(dp(if(material3)16 else 24),0,dp(if(material3)16 else 24),dp(12))}
-        rows=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL};content.addView(rows)
-        setup=button("Download English voice model"){setupModel()};content.addView(setup);scroll.addView(content);root.addView(scroll,LinearLayout.LayoutParams(-1,0,1f))
+        notesHost=NotesHost()
+        notesHost.addView(createNotesPage(),FrameLayout.LayoutParams(-1,-1))
+        root.addView(notesHost,LinearLayout.LayoutParams(-1,0,1f))
         val bottom=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;setPadding(dp(18),dp(8),dp(18),dp(18))}
         liveText=label("",16f).apply{
             maxLines=5;visibility=View.GONE;isVerticalScrollBarEnabled=true
@@ -163,35 +166,80 @@ class MainActivity : AppCompatActivity() {
             val row=LinearLayout(this).apply{gravity=Gravity.CENTER_VERTICAL;minimumHeight=dp(if(material3)72 else 66);if(material3)setPadding(dp(16),dp(4),dp(4),dp(4))}
             val text=label(n.text,17f);row.addView(text,LinearLayout.LayoutParams(0,-2,1f))
             val menu=button("···"){noteMenu(n)};if(menu is MaterialButton){menu.setPadding(0,0,0,0);menu.insetTop=0;menu.insetBottom=0;menu.minimumWidth=0};menu.contentDescription="Actions for ${n.text.take(50)}";row.addView(menu,LinearLayout.LayoutParams(dp(if(material3)48 else 38),dp(if(material3)48 else 44)))
-            // Only TODO's right swipe completes an item. Left swipes and all DONE swipes
-            // are handled by Activity.dispatchTouchEvent, including gestures on empty space.
+            // Translate the outer item, including its surface, border, menu and separator.
+            val item:View=if(material3){
+                MaterialCardView(this).apply{
+                    radius=dp(16).toFloat();cardElevation=0f;strokeWidth=dp(1);strokeColor=border
+                    setCardBackgroundColor(MaterialColors.layer(surface,primary,.04f));addView(row)
+                }
+            }else{
+                LinearLayout(this).apply{
+                    orientation=LinearLayout.VERTICAL;addView(row)
+                    addView(View(this@MainActivity).apply{setBackgroundColor(border)},LinearLayout.LayoutParams(-1,dp(1)))
+                }
+            }
+            rows.addView(item,LinearLayout.LayoutParams(-1,-2).apply{if(material3)bottomMargin=dp(8)})
+            // Left swipes and all DONE swipes belong to screen navigation.
             if(!done){
                 var x=0f;var y=0f;var horizontal=false;var blocked=false
+                fun reset(){item.animate().cancel();item.translationX=0f}
                 row.setOnTouchListener{v,event -> when(event.actionMasked){
-                    MotionEvent.ACTION_DOWN->{x=event.rawX;y=event.rawY;horizontal=false;blocked=false;true}
+                    MotionEvent.ACTION_DOWN->{reset();x=event.rawX;y=event.rawY;horizontal=false;blocked=false;true}
                     MotionEvent.ACTION_MOVE->{val dx=event.rawX-x;val dy=event.rawY-y
                         if(!horizontal&&abs(dy)>dp(12)&&abs(dy)*1.3f>=abs(dx))blocked=true
                         if(!blocked&&dx>dp(12)&&dx>abs(dy)*1.3f)horizontal=true
-                        if(horizontal){v.parent.requestDisallowInterceptTouchEvent(true);v.translationX=dx.coerceIn(0f,dp(120).toFloat())};true}
-                    MotionEvent.ACTION_UP->{val complete=!blocked&&completesNote(done,event.rawX-x,event.rawY-y,dp(80).toFloat());v.translationX=0f;if(complete)move(n,true);true}
-                    MotionEvent.ACTION_POINTER_DOWN->{blocked=true;horizontal=false;v.translationX=0f;true}
-                    MotionEvent.ACTION_CANCEL->{v.translationX=0f;horizontal=false;blocked=true;true};else->false}
+                        if(horizontal){v.parent.requestDisallowInterceptTouchEvent(true);item.translationX=dx.coerceIn(0f,maxOf(item.width.toFloat(),dp(120).toFloat()))};true}
+                    MotionEvent.ACTION_UP->{val complete=!blocked&&completesNote(done,event.rawX-x,event.rawY-y,dp(80).toFloat());reset();if(complete)move(n,true);true}
+                    MotionEvent.ACTION_POINTER_DOWN->{blocked=true;horizontal=false;reset();true}
+                    MotionEvent.ACTION_CANCEL->{reset();horizontal=false;blocked=true;true};else->false}
                 }
             }
-            if(material3){
-                val card=MaterialCardView(this).apply{
-                    radius=dp(16).toFloat();cardElevation=0f;strokeWidth=dp(1);strokeColor=border
-                    setCardBackgroundColor(MaterialColors.layer(surface,primary,.04f));addView(row)
-                };rows.addView(card,LinearLayout.LayoutParams(-1,-2).apply{bottomMargin=dp(8)})
-            }else{rows.addView(row);rows.addView(View(this).apply{setBackgroundColor(border)},LinearLayout.LayoutParams(-1,dp(1)))}
         };setup.visibility=if(!ready&&!done)View.VISIBLE else View.GONE;updateControls()
         if(showNewest)notesScroll.post{notesScroll.scrollTo(0,0)}
     }
+    private fun createNotesPage():ScrollView{
+        val scroll=ScrollView(this).apply{isFillViewport=true;setBackgroundColor(surface)}
+        val content=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;gravity=Gravity.BOTTOM;setPadding(dp(if(material3)16 else 24),0,dp(if(material3)16 else 24),dp(12))}
+        rows=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL};content.addView(rows)
+        setup=button("Download English voice model"){setupModel()};content.addView(setup)
+        scroll.addView(content);notesScroll=scroll
+        return scroll
+    }
+    private fun finishTabTransition(){
+        tabAnimationGeneration++;tabAnimating=false
+        if(!::notesHost.isInitialized)return
+        for(i in notesHost.childCount-1 downTo 0){
+            val page=notesHost.getChildAt(i)
+            page.animate().withEndAction(null).cancel();page.translationX=0f
+            if(page!==notesScroll)notesHost.removeView(page)
+        }
+        notesScroll.importantForAccessibility=View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+    }
     private fun switchScreen(showDone:Boolean){
         if(capturing||finishing||done==showDone)return
+        finishTabTransition()
+        val previous=notesScroll
         done=showDone
         if(done){(getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(draft.windowToken,0);draft.clearFocus()}
+        val current=createNotesPage();notesHost.addView(current,FrameLayout.LayoutParams(-1,-1))
         render(showNewest=true)
+        if(notesHost.width==0||!notesHost.isLaidOut||!ValueAnimator.areAnimatorsEnabled()){
+            finishTabTransition();return
+        }
+        val distance=notesHost.width.toFloat()*(if(showDone)1f else -1f)
+        val generation=++tabAnimationGeneration
+        tabAnimating=true
+        previous.importantForAccessibility=View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+        current.translationX=distance
+        previous.animate().translationX(-distance).setDuration(220).setInterpolator(DecelerateInterpolator()).start()
+        current.animate().translationX(0f).setDuration(220).setInterpolator(DecelerateInterpolator()).withEndAction{
+            if(generation==tabAnimationGeneration)finishTabTransition()
+        }.start()
+    }
+    /** Prevent touches reaching an outgoing page, while keeping the tabs available for reversal. */
+    private inner class NotesHost:FrameLayout(this@MainActivity){
+        init{isClickable=true;clipChildren=true}
+        override fun onInterceptTouchEvent(event:MotionEvent)=tabAnimating||super.onInterceptTouchEvent(event)
     }
     private fun cancelChildTouch(event:MotionEvent){
         val cancelEvent=MotionEvent.obtain(event);cancelEvent.action=MotionEvent.ACTION_CANCEL
@@ -394,7 +442,7 @@ class MainActivity : AppCompatActivity() {
         };panel.addView(test)
         panel.addView(button(if(ready)"Check voice model" else "Download voice model"){settingsDialog?.dismiss();setupModel()})
         panel.addView(button("Export backup"){exportBackup()});panel.addView(button("Import backup"){importBackup()})
-        panel.addView(label("VNotes 3.3 · native Kotlin\nEnglish Moonshine Tiny · local processing",12f))
+        panel.addView(label("VNotes 3.3.1 · native Kotlin\nEnglish Moonshine Tiny · local processing",12f))
         val scroll=ScrollView(this).apply{addView(panel)}
         settingsDialog=dialogBuilder().setTitle("Settings").setView(scroll).setPositiveButton("Done",null).create().also{d->d.setOnDismissListener{stopTest();permissionAction=null;settingsDialog=null};d.show()}
     }
@@ -412,7 +460,7 @@ class MainActivity : AppCompatActivity() {
         out.putString("draft",draft.text.toString());out.putBoolean("done",done);out.putBoolean("reopen_settings",reopenSettings)
         super.onSaveInstanceState(out)
     }
-    override fun onStop(){super.onStop();snackbar.dismiss();stopTest();settingsDialog?.dismiss();permissionAction=null;if(capturing){finishing=true;capture?.stop(false,"background");updateControls()}}
+    override fun onStop(){super.onStop();finishTabTransition();snackbar.dismiss();stopTest();settingsDialog?.dismiss();permissionAction=null;if(capturing){finishing=true;capture?.stop(false,"background");updateControls()}}
     override fun onDestroy(){capture?.stop(true);liveGeneration++;liveSession?.cancel();stopTest();executor.execute{speech.close()};executor.shutdown();store.close();super.onDestroy()}
 
     private inner class LevelView:View(this@MainActivity){

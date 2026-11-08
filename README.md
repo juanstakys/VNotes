@@ -16,7 +16,7 @@ No localhost server, USB port forwarding or browser is required. Start VNotes, t
 
 The Kotlin app uses native Android `AudioRecord` and native Moonshine Tiny, not WebView or browser speech APIs. Its model files differ from the PWA and need their own one-time download.
 
-The 3.3 update installs over the previous APK and preserves notes, settings and downloaded model files.
+The 3.3.1 update installs over the previous APK and preserves notes, settings and downloaded model files.
 
 ## Data and behavior
 
@@ -24,6 +24,7 @@ The 3.3 update installs over the previous APK and preserves notes, settings and 
 - Settings → **Material Design 3** switches the entire app between Material components and the default **Original Design**. The choice is saved, and switching preserves your unsent draft and selected tab.
 - During recording, the text box becomes a microphone level bar and timer. A live transcript appears above it and revises as you speak. Stop or silence detection flushes the final phrase and saves one note; recorded edits still require review. Separate Cancel discards the recording and preview.
 - Energy VAD: 300ms minimum sound, configurable silence interval, up to 2-minute capture, logarithmic sensitivity slider and a settings microphone test.
+- Switching TODO/DONE slides the note pages horizontally in both designs. Completion dragging moves the whole card, including its background, border and menu.
 - Swipe left anywhere on the main screen to open DONE; swipe right in DONE to return to TODO. Right-swiping a TODO item still marks it done. Edit only through the item’s **··· → Edit** menu. Restore and individual permanent deletion are in the DONE item menu; the trash button erases all done notes after confirmation.
 - Moves show a non-modal snackbar immediately above the input, with **UNDO** on the right.
 - Settings exports/imports JSON backups via Android's document picker. Import the PWA's JSON backup to transfer existing notes; the app cannot access browser IndexedDB automatically. Existing matching IDs remain unchanged.
