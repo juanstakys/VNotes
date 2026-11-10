@@ -1,0 +1,490 @@
+@
+<a id="audio"></a>
+<h2>3. Capture and recognition</h2>
+<p>Capture timings derive from sample counts at 16 kHz, so UI scheduling delays do not affect silence detection.</p>
+<p>For a block of N signed 16-bit samples, RMS is the square root of the mean squared normalized amplitude. The default threshold is 0.01. Accumulate 300 ms of above-threshold samples to arm automatic stop. Once armed, stop after the configured uninterrupted quiet interval (2 seconds by default). Counting samples avoids treating delayed callbacks as silence. The maximum take is 120 seconds, or 1,920,000 floats at 16 kHz. The full-take buffer costs about 7.7 MB before queued audio and inference memory.</p>
+<p>Model inference proceeds independently of capture. Slow inference can delay visible hypotheses while the microphone still captures every block. A manual stop flushes any backlog and the trailing phrase. Settings test mode measures the same signal path and skips inference.</p>
+@
+<h3>AudioCapture.kt</h3>
+<p>Read mono PCM16 from VOICE_RECOGNITION, normalize to floats and compute RMS for each 512-sample read. Keep at most 120 seconds. Test mode uses the same microphone path and omits the recording buffer.</p>
+<<file: android/app/src/main/kotlin/app/vnotes/AudioCapture.kt>>=
+package app.vnotes
+
+import android.annotation.SuppressLint
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
+import kotlin.math.sqrt
+
+/** Native mono PCM capture. Test mode never retains PCM or invokes the model. */
+class AudioCapture {
+    private val running = AtomicBoolean(false)
+    private val cancelled = AtomicBoolean(false)
+    @Volatile private var recorder: AudioRecord? = null
+    @Volatile private var reason = "manual"
+    val active
+        get() = running.get()
+
+    @SuppressLint("MissingPermission")
+    fun start(
+        test: Boolean,
+        silence: Double,
+        threshold: Double,
+        onLevel: (Double, Double, Double) -> Unit,
+        onDone: (FloatArray?, Boolean, String) -> Unit,
+        onError: (Throwable) -> Unit,
+        onAudio: (FloatArray) -> Unit = {},
+    ) {
+        check(!running.get()) { "Microphone is already running" }
+        val minimum =
+            AudioRecord.getMinBufferSize(
+                RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+            )
+        check(minimum > 0) { "16 kHz microphone input is unavailable ($minimum)" }
+        val input =
+            AudioRecord(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                maxOf(minimum * 2, 4096),
+            )
+        if (input.state != AudioRecord.STATE_INITIALIZED) {
+            input.release()
+            error("Android could not initialize the microphone")
+        }
+        recorder = input
+        cancelled.set(false)
+        reason = "manual"
+        try {
+            input.startRecording()
+            check(input.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                "Microphone could not start"
+            }
+        } catch (e: Throwable) {
+            input.release()
+            recorder = null
+            throw e
+        }
+        running.set(true)
+        thread(name = "VNotes microphone") {
+            val vad = EnergyVad(RATE, silence, threshold)
+            val pcm = if (test) null else FloatArray(RATE * 120)
+            val block = ShortArray(512)
+            var size = 0
+            var failure: Throwable? = null
+            try {
+                while (running.get()) {
+                    val count = input.read(block, 0, block.size, AudioRecord.READ_BLOCKING)
+                    if (!running.get()) break
+                    check(count > 0) {
+                        "Microphone read failed ($count). Check Android microphone access."
+                    }
+                    val previousSize = size
+                    var energy = 0.0
+                    for (i in 0 until count) {
+                        val value = block[i] / 32768f
+                        energy += value * value
+                        if (pcm != null && size < pcm.size) pcm[size++] = value
+                    }
+                    if (!test && size > previousSize) onAudio(pcm!!.copyOfRange(previousSize, size))
+                    val rms = sqrt(energy / count)
+                    val autoStop = vad.push(rms, count)
+                    onLevel(rms, vad.totalMs / 1000, vad.quietMs / 1000)
+                    if (!test && (autoStop || size == pcm!!.size)) {
+                        reason = if (autoStop) "silence" else "limit"
+                        running.set(false)
+                    }
+                }
+            } catch (e: Throwable) {
+                if (running.get()) failure = e
+            } finally {
+                running.set(false)
+                try {
+                    input.stop()
+                } catch (_: Exception) {}
+                input.release()
+                recorder = null
+            }
+            if (failure != null) onError(failure)
+            else {
+                val usable =
+                    vad.heard || (reason == "manual" && vad.peak > .0005 && vad.totalMs >= 150)
+                onDone(if (cancelled.get() || test) null else pcm!!.copyOf(size), usable, reason)
+            }
+        }
+    }
+
+    fun stop(cancel: Boolean = false, cause: String = "manual") {
+        if (cancel) cancelled.set(true)
+        reason = cause
+        running.set(false)
+        try {
+            recorder?.stop()
+        } catch (_: Exception) {}
+    }
+
+    companion object {
+        const val RATE = 16000
+    }
+}
+@
+<h3>EnergyVad.kt</h3>
+<p>Accumulate above-threshold speech before arming the silence timer. A new above-threshold block resets the quiet interval. The batch splitter looks for quiet boundaries in long recordings and assigns each sample to one segment.</p>
+<<file: android/app/src/main/kotlin/app/vnotes/EnergyVad.kt>>=
+package app.vnotes
+
+import kotlin.math.*
+
+class EnergyVad(
+    private val sampleRate: Int,
+    private val silenceSeconds: Double,
+    private val threshold: Double,
+) {
+    var speechMs = 0.0
+        private set
+
+    var quietMs = 0.0
+        private set
+
+    var peak = 0.0
+        private set
+
+    var totalMs = 0.0
+        private set
+
+    val heard
+        get() = speechMs >= 300.0
+
+    fun push(rms: Double, count: Int): Boolean {
+        val ms = count * 1000.0 / sampleRate
+        totalMs += ms
+        peak = max(peak, rms)
+        if (rms >= threshold) {
+            speechMs += ms
+            quietMs = 0.0
+        } else quietMs += ms
+        return heard && quietMs >= silenceSeconds * 1000.0
+    }
+
+    companion object {
+        fun threshold(position: Int) = (.1 * 10.0.pow(-position / 250.0)).coerceIn(.00001, .1)
+
+        fun position(threshold: Double) =
+            (-250 * log10(threshold / .1)).roundToInt().coerceIn(0, 1000)
+
+        fun level(rms: Double) =
+            ((20 * log10(max(.00001, rms)) + 100) / 100).coerceIn(0.0, 1.0).toFloat()
+    }
+}
+
+/** Prefer the quietest 250ms window between 12s and 20s; no samples overlap or disappear. */
+fun splitAudio(audio: FloatArray, rate: Int = 16000): List<IntRange> {
+    val ranges = ArrayList<IntRange>()
+    val maximum = 20 * rate
+    val window = rate / 4
+    var offset = 0
+    while (audio.size - offset > maximum) {
+        var lowest = Double.POSITIVE_INFINITY
+        var best = offset + maximum
+        for (start in offset + 12 * rate..offset + maximum - window step window) {
+            var energy = 0.0
+            for (i in start until start + window) energy += audio[i] * audio[i]
+            if (energy <= lowest) {
+                lowest = energy
+                best = start + window / 2
+            }
+        }
+        ranges.add(offset until best)
+        offset = best
+    }
+    if (offset < audio.size) ranges.add(offset until audio.size)
+    return ranges
+}
+@
+<h3>LiveSpeechSession.kt</h3>
+<p>One serial executor orders start, immutable audio feeds, final flush and abort. Cancellation markers suppress queued recognition and late text callbacks. Bound queued samples by the maximum take size.</p>
+<<file: android/app/src/main/kotlin/app/vnotes/LiveSpeechSession.kt>>=
+package app.vnotes
+
+import java.util.concurrent.CancellationException
+import java.util.concurrent.Executor
+
+interface LiveSpeech {
+    fun start(onText: (String) -> Unit)
+
+    fun feed(audio: FloatArray)
+
+    /** Flush the trailing phrase and release this take’s native resources. */
+    fun finish(): String
+
+    fun abort()
+}
+
+/**
+ * Capture only enqueues immutable PCM. All model work stays on one serial executor. At most one
+ * 120-second take can be queued; cancellation skips queued inference immediately.
+ */
+class LiveSpeechSession(
+    private val executor: Executor,
+    private val engine: LiveSpeech,
+    private val onText: (String) -> Unit,
+    private val onError: (Throwable) -> Unit,
+    private val maxSamples: Int = 16000 * 120,
+) {
+    private val lock = Any()
+    @Volatile private var cancelled = false
+    @Volatile private var failure: Throwable? = null
+    @Volatile private var finished = false
+    private var ending = false
+    private var samples = 0
+
+    init {
+        executor.execute {
+            if (!cancelled)
+                try {
+                    engine.start { text ->
+                        if (!cancelled && !finished && failure == null) onText(text)
+                    }
+                } catch (e: Throwable) {
+                    fail(e)
+                }
+        }
+    }
+
+    private fun fail(error: Throwable) {
+        synchronized(lock) {
+            if (failure == null && !cancelled && !finished) {
+                failure = error
+                onError(error)
+            }
+        }
+    }
+
+    fun offer(audio: FloatArray) {
+        synchronized(lock) {
+            if (ending || cancelled || failure != null || audio.isEmpty()) return
+            if (audio.size > maxSamples - samples) {
+                fail(IllegalArgumentException("Live recording exceeds two minutes"))
+                return
+            }
+            samples += audio.size
+            val copy = audio.copyOf()
+            executor.execute {
+                if (!cancelled && failure == null)
+                    try {
+                        engine.feed(copy)
+                    } catch (e: Throwable) {
+                        fail(e)
+                    }
+            }
+        }
+    }
+
+    fun finish(onComplete: (Result<String>) -> Unit) {
+        synchronized(lock) {
+            if (ending) return
+            ending = true
+            executor.execute {
+                val result =
+                    try {
+                        if (cancelled) throw CancellationException("Live transcription cancelled")
+                        failure?.let { throw it }
+                        Result.success(
+                            engine.finish().also {
+                                check(it.isNotBlank()) { "No words detected in live recording" }
+                            }
+                        )
+                    } catch (e: Throwable) {
+                        try {
+                            engine.abort()
+                        } catch (_: Throwable) {}
+                        Result.failure(e)
+                    }
+                finished = true
+                onComplete(
+                    if (cancelled)
+                        Result.failure(CancellationException("Live transcription cancelled"))
+                    else result
+                )
+            }
+        }
+    }
+
+    fun cancel() {
+        synchronized(lock) {
+            if (cancelled || finished) return
+            cancelled = true
+            ending = true
+            executor.execute {
+                try {
+                    engine.abort()
+                } catch (_: Throwable) {} finally {
+                    finished = true
+                }
+            }
+        }
+    }
+}
+@
+<h3>LiveTranscript.kt</h3>
+<p>A line ID identifies a revisable hypothesis. Replace its text and order lines by start time to avoid appending duplicate partial words.</p>
+<<file: android/app/src/main/kotlin/app/vnotes/LiveTranscript.kt>>=
+package app.vnotes
+
+/** Replace hypotheses by line ID: partial revisions must never duplicate earlier words. */
+class LiveTranscript {
+    private data class Line(val start: Float, val text: String)
+
+    private val lines = LinkedHashMap<Long, Line>()
+
+    fun update(id: Long, start: Float, text: String) {
+        lines[id] = Line(start, text.trim())
+    }
+
+    val text: String
+        get() =
+            lines.entries
+                .sortedWith(compareBy({ it.value.start }, { it.key }))
+                .map { it.value.text }
+                .filter { it.isNotBlank() }
+                .joinToString(" ")
+}
+@
+<h3>SpeechEngine.kt</h3>
+<p>Pin the English Tiny architecture and reuse its private model directory. Enable incomplete-line decoding during capture. Stop flushes trailing words. Closing the transcriber after each live take releases retained event audio.</p>
+<<file: android/app/src/main/kotlin/app/vnotes/SpeechEngine.kt>>=
+package app.vnotes
+
+import ai.moonshine.voice.AssetDownloader
+import ai.moonshine.voice.JNI
+import ai.moonshine.voice.ModelSpec
+import ai.moonshine.voice.Transcriber
+import ai.moonshine.voice.TranscriberOption
+import ai.moonshine.voice.TranscriptEvent
+import ai.moonshine.voice.TranscriptLine
+import android.content.Context
+import java.io.File
+
+/** Call only on the single speech executor. Native inference never receives network audio. */
+class SpeechEngine(context: Context) {
+    private val root = File(context.filesDir, "models/moonshine-tiny-en")
+    private val spec = ModelSpec.stt("en", JNI.MOONSHINE_MODEL_ARCH_TINY, false)
+    private val downloader = AssetDownloader()
+    private var engine: Transcriber? = null
+
+    fun present() = downloader.isModelPresent(root, spec)
+
+    fun setup(progress: (String) -> Unit) {
+        root.mkdirs()
+        downloader.ensureModelPresent(root, spec) { name, index, total, done, bytes ->
+            progress("$index/$total · $name" + if (bytes > 0) " · ${done*100/bytes}%" else "")
+        }
+        load()
+        progress("Voice ready offline")
+    }
+
+    private fun load(): Transcriber {
+        engine?.let {
+            return it
+        }
+        check(present()) { "Download the English model first" }
+        val transcriber = Transcriber(listOf(TranscriberOption("decode_incomplete_lines", "true")))
+        try {
+            transcriber.loadFromFiles(root.absolutePath, JNI.MOONSHINE_MODEL_ARCH_TINY)
+        } catch (e: Throwable) {
+            transcriber.close()
+            throw e
+        }
+        engine = transcriber
+        return transcriber
+    }
+
+    private var liveTranscript: LiveTranscript? = null
+
+    fun startLive(onText: (String) -> Unit) {
+        val transcriber = load()
+        val transcript = LiveTranscript()
+        liveTranscript = transcript
+        var previous = ""
+        transcriber.removeAllListeners()
+        transcriber.setUpdateInterval(.5) // SDK adapts the cadence to actual inference cost.
+        transcriber.addListener { event ->
+            val line: TranscriptLine? =
+                when (event) {
+                    is TranscriptEvent.LineStarted -> event.line
+                    is TranscriptEvent.LineUpdated -> event.line
+                    is TranscriptEvent.LineTextChanged -> event.line
+                    is TranscriptEvent.LineCompleted -> event.line
+                    is TranscriptEvent.Error -> throw event.cause
+                    else -> null
+                }
+            if (line != null) {
+                transcript.update(line.id, line.startTime, line.text.orEmpty())
+                val text = transcript.text
+                if (text != previous) {
+                    previous = text
+                    onText(text)
+                }
+            }
+        }
+        transcriber.start()
+    }
+
+    fun feedLive(audio: FloatArray) {
+        check(liveTranscript != null) { "Live transcription has not started" }
+        checkNotNull(engine).addAudio(audio, AudioCapture.RATE)
+    }
+
+    fun finishLive(): String {
+        try {
+            checkNotNull(engine)
+                .stop() // Force a final pass, including the trailing partial phrase.
+            return checkNotNull(liveTranscript).text.also {
+                check(it.isNotBlank()) { "No words detected" }
+            }
+        } finally {
+            abortLive()
+        }
+    }
+
+    fun abortLive() {
+        liveTranscript = null
+        // Close per take: SDK completed-line events retain PCM; do not accumulate them across
+        // notes.
+        val old = engine
+        engine = null
+        old?.removeAllListeners()
+        old?.close()
+    }
+
+    fun transcribe(audio: FloatArray, progress: (String) -> Unit): String {
+        val transcriber = load()
+        val parts = ArrayList<String>()
+        val ranges = splitAudio(audio)
+        ranges.forEachIndexed { index, range ->
+            progress("Transcribing ${index+1}/${ranges.size}…")
+            val text =
+                transcriber
+                    .transcribeWithoutStreaming(
+                        audio.copyOfRange(range.first, range.last + 1),
+                        AudioCapture.RATE,
+                    )
+                    .text()
+                    .trim()
+            if (text.isNotBlank()) parts.add(text)
+        }
+        return parts.joinToString(" ").also {
+            check(it.isNotBlank()) { "No words detected. Retry or discard the recording." }
+        }
+    }
+
+    fun close() {
+        abortLive()
+    }
+}
+@

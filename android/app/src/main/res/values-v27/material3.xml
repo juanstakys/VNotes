@@ -1,3 +1,0 @@
-<resources><style name="Material3Theme" parent="Material3Base">
-<item name="android:navigationBarColor">#F7FBF4</item><item name="android:windowLightNavigationBar">true</item>
-</style></resources>

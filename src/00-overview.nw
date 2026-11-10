@@ -1,0 +1,18 @@
+@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VNotes engineering manual</title>
+<style>body{max-width:62rem;margin:auto;padding:2rem 1rem;font:1rem/1.55 system-ui,sans-serif;color:#19251e}h2{margin-top:3rem}pre{padding:1rem;background:#f1f5f2;overflow:auto;font-size:.85rem}a{color:#245f3a}p{max-width:76ch}</style></head><body>
+<h1>VNotes engineering manual</h1>
+<p>A task is either active or completed. A voice take becomes durable text when recognition finishes. The application runs on Android 8 or later and uses English Moonshine Tiny on the device. Network access supplies the initial model download.</p>
+<h2>Reading and changing the program</h2>
+<p>Read the chapters in order for the interaction model, the Flutter-to-Android boundary, audio processing, storage, and the build. Each file root names a destination relative to <code>code/</code>. Named chunks inside a root expand in the displayed order. Edit the corresponding chapter in <code>src/</code>, then run <code>python3 scripts/literate.py</code>. The script invokes notangle for each file and noweave for this cross-referenced manual. Its <code>--check</code> mode detects drift between either generated output and the sources.</p>
+<h2>Ownership and boundaries</h2>
+<p>Dart owns widget state, user decisions, and Material 3 presentation. Android owns the microphone permission, audio hardware, model files, document picker and SQLite transactions. A method channel carries commands, text and meter readings. Keeping PCM and inference on the Android side avoids copying a continuous audio stream through the Flutter engine. The Kotlin components for capture and persistence carry forward the existing file formats and model directory.</p>
+<p>For a typed task, the composer trims the input, calls add, then reloads the committed list. For a recording, the capture thread feeds the serial recognition worker, which publishes revisable hypotheses. At stop, capture writes retry audio before the worker flushes its final hypothesis. A new task uses the stable take ID. A recorded replacement goes through an editable review dialog.</p>
+<nav aria-label="Chapters"><ol>
+<li><a href="#interface">Flutter interaction model</a></li>
+<li><a href="#platform">Android service boundary</a></li>
+<li><a href="#audio">Capture and recognition</a></li>
+<li><a href="#storage">Storage and recovery</a></li>
+<li><a href="#build">Build and verification</a></li>
+</ol></nav>

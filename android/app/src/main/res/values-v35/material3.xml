@@ -1,4 +1,0 @@
-<resources><style name="Material3Theme" parent="Material3Base">
-<item name="android:navigationBarColor">#F7FBF4</item><item name="android:windowLightNavigationBar">true</item>
-<item name="android:windowOptOutEdgeToEdgeEnforcement">true</item>
-</style></resources>

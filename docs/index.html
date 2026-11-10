@@ -1,0 +1,2247 @@
+<!-- this file was generated automatically by noweave; better not edit it-->
+
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VNotes engineering manual</title>
+<style>body{max-width:62rem;margin:auto;padding:2rem 1rem;font:1rem/1.55 system-ui,sans-serif;color:#19251e}h2{margin-top:3rem}pre{padding:1rem;background:#f1f5f2;overflow:auto;font-size:.85rem}a{color:#245f3a}p{max-width:76ch}</style></head><body>
+<h1>VNotes engineering manual</h1>
+<p>A task is either active or completed. A voice take becomes durable text when recognition finishes. The application runs on Android 8 or later and uses English Moonshine Tiny on the device. Network access supplies the initial model download.</p>
+<h2>Reading and changing the program</h2>
+<p>Read the chapters in order for the interaction model, the Flutter-to-Android boundary, audio processing, storage, and the build. Each file root names a destination relative to <code>code/</code>. Named chunks inside a root expand in the displayed order. Edit the corresponding chapter in <code>src/</code>, then run <code>python3 scripts/literate.py</code>. The script invokes notangle for each file and noweave for this cross-referenced manual. Its <code>--check</code> mode detects drift between either generated output and the sources.</p>
+<h2>Ownership and boundaries</h2>
+<p><a name="NWD4G0RXi-1">Dart owns widget state, user decisions, and Material 3 presentation. Android owns the microphone permission, audio hardware, model files, document picker and SQLite transactions. A method channel carries commands, text and meter readings. Keeping PCM and inference on the Android side avoids copying a continuous audio stream through the Flutter engine. The Kotlin components for capture and persistence carry forward the existing file formats and model directory.</a></p>
+<p>For a typed task, the composer trims the input, calls add, then reloads the committed list. For a recording, the capture thread feeds the serial recognition worker, which publishes revisable hypotheses. At stop, capture writes retry audio before the worker flushes its final hypothesis. A new task uses the stable take ID. A recorded replacement goes through an editable review dialog.</p>
+<nav aria-label="Chapters"><ol>
+<li><a href="#interface">Flutter interaction model</a></li>
+<li><a href="#platform">Android service boundary</a></li>
+<li><a href="#audio">Capture and recognition</a></li>
+<li><a href="#storage">Storage and recovery</a></li>
+<li><a href="#build">Build and verification</a></li>
+</ol></nav>
+
+<a id="interface"></a>
+<h2><a name="NWD2ee5ue-2">1. Flutter interaction model</a></h2>
+<p>A single screen owns two task projections and their shared composer. Material 3 supplies the component theme, tabs, cards, dialogs, settings and snackbar.</p>
+
+<h3><a name="NWD2ee5ue-3">main.dart</a></h3>
+<p>The widget coordinates short-lived presentation state. SQLite is the authority for task membership.</p>
+<pre><a name="NW2ee5ue-4SkZON-1" href="#NWD2ee5ue-3"><dfn>&lt;file: lib/main.dart&gt;=</dfn></a>
+<a name="NW2ee5ue-4SkZON-1-u1" href="#NWD2ee5ue-4"><i>&lt;Application and controllers&gt;</i></a>
+<a name="NW2ee5ue-4SkZON-1-u2" href="#NWD2ee5ue-5"><i>&lt;Startup and native events&gt;</i></a>
+<a name="NW2ee5ue-4SkZON-1-u3" href="#NWD2ee5ue-6"><i>&lt;Voice and task commands&gt;</i></a>
+<a name="NW2ee5ue-4SkZON-1-u4" href="#NWD2ee5ue-7"><i>&lt;Editing and shared action&gt;</i></a>
+<a name="NW2ee5ue-4SkZON-1-u5" href="#NWD2ee5ue-8"><i>&lt;Energy feedback and settings&gt;</i></a>
+<a name="NW2ee5ue-4SkZON-1-u6" href="#NWD2ee5ue-9"><i>&lt;Task pages and gestures&gt;</i></a>
+</pre><p>
+<h4><a name="NWD2ee5ue-4">Application and controllers</a></h4>
+<p>Select Material 3 at application creation. Keep the draft controller alive across tab changes. A separate meter notifier limits audio-level redraws to its listener.</p>
+<pre><a name="NW2ee5ue-35Ydqa-1" href="#NWD2ee5ue-4"><dfn>&lt;Application and controllers&gt;=</dfn></a> <b>(<a href="#NWD2ee5ue-3">&lt;-U</a>)</b>
+import 'dart:convert';
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+void main() =&gt; runApp(
+  MaterialApp(
+    debugShowCheckedModeBanner: false,
+    theme: ThemeData(
+      useMaterial3: true,
+      colorSchemeSeed: const Color(0xff315b3b),
+    ),
+    home: const Notes(),
+  ),
+);
+
+typedef RowData = Map&lt;String, dynamic&gt;;
+const host = MethodChannel('vnotes/android');
+
+class Notes extends StatefulWidget {
+  const Notes({super.key});
+  @override
+  State&lt;Notes&gt; createState() =&gt; _NotesState();
+}
+
+class _NotesState extends State&lt;Notes&gt; with SingleTickerProviderStateMixin {
+  late final tabs = TabController(length: 2, vsync: this);
+  final activeScroll = ScrollController();
+  final draft = TextEditingController();
+  final meter = ValueNotifier&lt;double&gt;(0);
+  List&lt;RowData&gt; notes = [];
+  bool ready = false,
+      recording = false,
+      busy = false,
+      pending = false,
+      testing = false;
+  double threshold = .01, silence = 2;
+  int elapsed = 0;
+  bool processing = false;
+  String partial = '', status = '';
+  Offset? swipeStart;
+  bool get done =&gt; tabs.index == 1;
+
+</pre><p>
+<h4><a name="NWD2ee5ue-5">Startup and native events</a></h4>
+<p>Register the event handler before reading model presence and pending audio. Partial recognition is provisional. Only completion reloads durable notes or opens replacement review.</p>
+<pre><a name="NW2ee5ue-34myIw-1" href="#NWD2ee5ue-5"><dfn>&lt;Startup and native events&gt;=</dfn></a> <b>(<a href="#NWD2ee5ue-3">&lt;-U</a>)</b>
+  @override
+  void initState() {
+    super.initState();
+    tabs.addListener(refresh);
+    draft.addListener(refresh);
+    host.setMethodCallHandler(events);
+    guard(initialize);
+  }
+
+  void refresh() {
+    if (mounted) setState(() {});
+  }
+
+  void message(String text) {
+    if (mounted)
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  Future&lt;void&gt; guard(Future&lt;void&gt; Function() action) async {
+    try {
+      await action();
+    } catch (e) {
+      message(e.toString());
+    }
+  }
+
+  Future&lt;void&gt; load() async {
+    final rows = await host.invokeListMethod&lt;String&gt;('notes') ?? [];
+    notes = rows.map((s) =&gt; jsonDecode(s) as RowData).toList();
+    pending = await host.invokeMethod&lt;bool&gt;('pending') ?? false;
+    refresh();
+  }
+
+  Future&lt;void&gt; initialize() async {
+    await load();
+    final prefs = await host.invokeMapMethod&lt;String, double&gt;('settings');
+    threshold = prefs?['threshold'] ?? .01;
+    silence = prefs?['silence'] ?? 2;
+    ready = await host.invokeMethod&lt;bool&gt;('present') ?? false;
+    refresh();
+  }
+
+  Future&lt;void&gt; events(MethodCall call) async {
+    if (!mounted) return;
+    switch (call.method) {
+      case 'level':
+        final values = call.arguments as List;
+        elapsed = (values[1] as num).toInt();
+        meter.value = (values[0] as num).toDouble();
+        return;
+      case 'partial':
+        partial = call.arguments as String;
+      case 'progress':
+        status = call.arguments as String;
+      case 'finishing':
+        processing = true;
+        recording = false;
+        busy = true;
+        status = 'Finishing transcription…';
+      case 'ended':
+      case 'finished':
+        processing = busy = recording = testing = false;
+        partial = status = '';
+        meter.value = 0;
+        await load();
+        if (call.method == 'ended' &amp;&amp; call.arguments != null)
+          message(call.arguments as String);
+        if (call.method == 'finished') {
+          final data = call.arguments as Map;
+          if (data['id'] != null)
+            await editText(
+              data['id'] as String,
+              data['text'] as String,
+              recorded: true,
+            );
+        }
+    }
+    refresh();
+  }
+
+</pre><p>
+<h4><a name="NWD2ee5ue-6">Voice and task commands</a></h4>
+<p>Request microphone permission on demand. Undo restores the previous timestamps for a surviving task, preserving any subsequent text edits.</p>
+<pre><a name="NW2ee5ue-2SpOw1-1" href="#NWD2ee5ue-6"><dfn>&lt;Voice and task commands&gt;=</dfn></a> <b>(<a href="#NWD2ee5ue-3">&lt;-U</a>)</b>
+  Future&lt;void&gt; download() async {
+    if (busy || recording) return;
+    setState(() {
+      busy = true;
+      status = 'Downloading English model…';
+    });
+    try {
+      ready = await host.invokeMethod&lt;bool&gt;('download') ?? false;
+    } finally {
+      busy = false;
+      status = '';
+      refresh();
+    }
+  }
+
+  Future&lt;void&gt; record({String? id, bool test = false}) async {
+    if (busy || recording || testing) return;
+    if (!test &amp;&amp; !ready) {
+      message('Download the English voice model first');
+      return;
+    }
+    if (await host.invokeMethod&lt;bool&gt;('permission') != true) {
+      message('Microphone permission is required');
+      return;
+    }
+    await host.invokeMethod(test ? 'test' : 'record', {'id': id});
+    testing = test;
+    recording = !test;
+    partial = status = '';
+    meter.value = 0;
+    refresh();
+  }
+
+  Future&lt;void&gt; mutate(String op, [RowData? args]) async {
+    await host.invokeMethod(op, args);
+    await load();
+  }
+
+  Future&lt;void&gt; move(RowData n) async {
+    await mutate('move', n);
+    if (!mounted) return;
+    final bar = ScaffoldMessenger.of(context);
+    bar.clearSnackBars();
+    bar.showSnackBar(
+      SnackBar(
+        content: Text(
+          n['deletedAt'] == null ? 'Moved to DONE' : 'Restored to TODO',
+        ),
+        action: SnackBarAction(
+          label: 'UNDO',
+          onPressed: () =&gt; guard(() =&gt; mutate('undo', n)),
+        ),
+      ),
+    );
+  }
+
+</pre><p>
+<h4><a name="NWD2ee5ue-7">Editing and shared action</a></h4>
+<p>The item menu owns editing. Recording a replacement requires a second Save decision. Whitespace selects recording and trimmed text selects insertion.</p>
+<pre><a name="NW2ee5ue-L3yOV-1" href="#NWD2ee5ue-7"><dfn>&lt;Editing and shared action&gt;=</dfn></a> <b>(<a href="#NWD2ee5ue-3">&lt;-U</a>)</b>
+  Future&lt;bool&gt; confirm(String title, String action) async =&gt;
+      await showDialog&lt;bool&gt;(
+        context: context,
+        builder: (c) =&gt; AlertDialog(
+          title: Text(title),
+          actions: [
+            TextButton(
+              onPressed: () =&gt; Navigator.pop(c, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () =&gt; Navigator.pop(c, true),
+              child: Text(action),
+            ),
+          ],
+        ),
+      ) ??
+      false;
+  Future&lt;void&gt; editText(
+    String id,
+    String initial, {
+    bool recorded = false,
+  }) async {
+    String value = initial;
+    final text = await showDialog&lt;String&gt;(
+      context: context,
+      builder: (c) =&gt; AlertDialog(
+        title: Text(recorded ? 'Review recording' : 'Edit note'),
+        content: TextFormField(
+          initialValue: initial,
+          autofocus: true,
+          maxLines: 5,
+          maxLength: 20000,
+          onChanged: (s) =&gt; value = s,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () =&gt; Navigator.pop(c),
+            child: const Text('Cancel'),
+          ),
+          if (recorded)
+            TextButton(
+              onPressed: () =&gt; Navigator.pop(c, ''),
+              child: const Text('Record again'),
+            ),
+          FilledButton(
+            onPressed: () {
+              if (value.trim().isNotEmpty) Navigator.pop(c, value.trim());
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (text == '' &amp;&amp; recorded) {
+      await record(id: id);
+      return;
+    }
+    if (text != null) await mutate('edit', {'id': id, 'text': text});
+  }
+
+  Future&lt;void&gt; menu(String choice, RowData n) async {
+    if (choice == 'Edit') {
+      final mode = await showDialog&lt;String&gt;(
+        context: context,
+        builder: (c) =&gt; SimpleDialog(
+          title: const Text('Edit note'),
+          children: [
+            for (final m in ['Type', 'Record'])
+              SimpleDialogOption(
+                onPressed: () =&gt; Navigator.pop(c, m),
+                child: Text(m),
+              ),
+          ],
+        ),
+      );
+      if (mode == 'Type') await editText(n['id'], n['text']);
+      if (mode == 'Record') await record(id: n['id']);
+    } else if (choice == 'Erase forever') {
+      if (await confirm('Erase this note forever?', 'Erase'))
+        await mutate('erase', n);
+    } else {
+      await move(n);
+    }
+  }
+
+  Future&lt;void&gt; primary() async {
+    if (recording) {
+      await host.invokeMethod('stop');
+      return;
+    }
+    if (done) {
+      if (await confirm('Empty DONE?', 'Erase all')) await mutate('empty');
+      return;
+    }
+    final text = draft.text.trim();
+    if (text.isEmpty) {
+      await record();
+      return;
+    }
+    await mutate('add', {'text': text});
+    if(activeScroll.hasClients)activeScroll.jumpTo(0);
+    draft.clear();
+  }
+
+</pre><p>
+<h4><a name="NWD2ee5ue-8">Energy feedback and settings</a></h4>
+<p>The slider covers four decades of RMS amplitude. Persist the numeric threshold so changes in slider presentation do not change its meaning. A test capture emits energy readings and retains no take.</p>
+<pre><a name="NW2ee5ue-cux5m-1" href="#NWD2ee5ue-8"><dfn>&lt;Energy feedback and settings&gt;=</dfn></a> <b>(<a href="#NWD2ee5ue-3">&lt;-U</a>)</b>
+  Widget level({bool marker = false}) =&gt; ValueListenableBuilder&lt;double&gt;(
+    valueListenable: meter,
+    builder: (c, rms, _) {
+      double scale(double v) =&gt;
+          (1 + math.log(math.max(v, .00001)) / math.ln10 / 5)
+              .clamp(0, 1)
+              .toDouble();
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          LinearProgressIndicator(value: scale(rms)),
+          if (!marker)
+            Text(
+              &quot;${elapsed ~/ 60}:${(elapsed % 60).toString().padLeft(2, '0')}&quot;,
+            ),
+          if (marker)
+            Text(
+              '${rms &gt;= threshold ? &quot;Sound detected&quot; : &quot;Quiet&quot;} · ${rms.toStringAsFixed(5)} RMS',
+            ),
+        ],
+      );
+    },
+  );
+  Future&lt;void&gt; settings() async {
+    await showDialog&lt;void&gt;(
+      context: context,
+      builder: (c) =&gt; StatefulBuilder(
+        builder: (c, update) =&gt; AlertDialog(
+          title: const Text('Settings'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                DropdownButton&lt;double&gt;(
+                  value: [.7, 1.0, 2.0, 3.0, 5.0].reduce(
+                    (a, b) =&gt; (a - silence).abs() &lt; (b - silence).abs() ? a : b,
+                  ),
+                  items: [.7, 1.0, 2.0, 3.0, 5.0]
+                      .map(
+                        (v) =&gt; DropdownMenuItem(
+                          value: v,
+                          child: Text('Stop after ${v}s silence'),
+                        ),
+                      )
+                      .toList(),
+                  onChanged: (v) {
+                    if (v != null) {
+                      update(() =&gt; silence = v);
+                      guard(
+                        () =&gt; host.invokeMethod('configure', {
+                          'key': 'silence',
+                          'value': v,
+                        }),
+                      );
+                    }
+                  },
+                ),
+                const Text('Microphone sensitivity'),
+                Slider(
+                  value: (-math.log(threshold / .1) / math.ln10 / 4)
+                      .clamp(0, 1)
+                      .toDouble(),
+                  onChanged: (v) =&gt;
+                      update(() =&gt; threshold = .1 * math.pow(10, -4 * v)),
+                  onChangeEnd: (_) =&gt; guard(
+                    () =&gt; host.invokeMethod('configure', {
+                      'key': 'threshold',
+                      'value': threshold,
+                    }),
+                  ),
+                ),
+                level(marker: true),
+                TextButton(
+                  onPressed: () =&gt; guard(() async {
+                    if (testing) {
+                      await host.invokeMethod('cancel');
+                      testing = false;
+                    } else {
+                      await record(test: true);
+                    }
+                    if (c.mounted) update(() {});
+                  }),
+                  child: Text(testing ? 'Stop test' : 'Test microphone'),
+                ),
+                for (final op in ['export', 'import'])
+                  TextButton(
+                    onPressed: () {
+                      Navigator.pop(c);
+                      guard(() async {
+                        if (op == 'export') {
+                          await mutate(op);
+                          return;
+                        }
+                        final count = await host.invokeMethod&lt;int&gt;('import');
+                        if (count != null &amp;&amp;
+                            await confirm('Import $count notes?', 'Import'))
+                          await mutate('merge');
+                      });
+                    },
+                    child: Text(
+                      op == 'export' ? 'Export backup' : 'Import backup',
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () =&gt; Navigator.pop(c),
+              child: const Text('Done'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (testing) await host.invokeMethod('cancel');
+  }
+
+</pre><p>
+<h4><a name="NWD2ee5ue-9">Task pages and gestures</a></h4>
+<p>A minimum viewport height and bottom-aligned column anchor short lists. The card is the dismissible child, so its entire surface follows the drag. Manual tab navigation uses the tab controller for the slide animation.</p>
+<pre><a name="NW2ee5ue-408F9Y-1" href="#NWD2ee5ue-9"><dfn>&lt;Task pages and gestures&gt;=</dfn></a> <b>(<a href="#NWD2ee5ue-3">&lt;-U</a>)</b>
+  Widget page(bool completed) {
+    final rows = notes
+        .where((n) =&gt; (n['deletedAt'] != null) == completed)
+        .toList();
+    final stamp = completed ? 'deletedAt' : 'createdAt';
+    rows.sort((a, b) =&gt; (b[stamp] as int).compareTo(a[stamp] as int));
+    return LayoutBuilder(
+      builder: (c, bounds) =&gt; SingleChildScrollView(
+        controller: completed ? null : activeScroll,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(minHeight: bounds.maxHeight),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              for (final n in rows)
+                Dismissible(
+                  key: ValueKey(n['id']),
+                  direction: completed
+                      ? DismissDirection.none
+                      : DismissDirection.startToEnd,
+                  confirmDismiss: (_) async {
+                    await guard(() =&gt; move(n));
+                    return false;
+                  },
+                  child: Card(
+                    child: ListTile(
+                      title: Text(n['text']),
+                      trailing: PopupMenuButton&lt;String&gt;(
+                        onSelected: (v) =&gt; guard(() =&gt; menu(v, n)),
+                        itemBuilder: (_) =&gt;
+                            (completed
+                                    ? ['Restore', 'Erase forever']
+                                    : ['Edit', 'Done'])
+                                .map(
+                                  (s) =&gt;
+                                      PopupMenuItem(value: s, child: Text(s)),
+                                )
+                                .toList(),
+                      ),
+                    ),
+                  ),
+                ),
+              if (!completed &amp;&amp; !ready)
+                TextButton(
+                  onPressed: busy ? null : () =&gt; guard(download),
+                  child: const Text('Download English voice model'),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) =&gt; Listener(
+    onPointerDown: (e) =&gt; swipeStart = e.position,
+    onPointerCancel: (_) =&gt; swipeStart = null,
+    onPointerUp: (e) {
+      final start = swipeStart;
+      swipeStart = null;
+      if (start == null || recording) return;
+      final delta = e.position - start;
+      if (delta.dx.abs() &lt; 80 || delta.dx.abs() &lt; delta.dy.abs() * 1.3) return;
+      if (!done &amp;&amp; delta.dx &lt; 0) tabs.animateTo(1);
+      if (done &amp;&amp; delta.dx &gt; 0) tabs.animateTo(0);
+    },
+    child: Scaffold(
+      body: SafeArea(
+        child: Column(
+          children: [
+            IgnorePointer(
+              ignoring: recording,
+              child: TabBar(
+                controller: tabs,
+                tabs: const [
+                  Tab(text: 'TODO'),
+                  Tab(text: 'DONE'),
+                ],
+              ),
+            ),
+            Expanded(
+              child: TabBarView(
+                controller: tabs,
+                physics: const NeverScrollableScrollPhysics(),
+                children: [page(false), page(true)],
+              ),
+            ),
+            if (partial.isNotEmpty) Text(partial, maxLines: 5),
+            if (status.isNotEmpty) Text(status),
+            if (recording || processing)
+              TextButton(
+                onPressed: () =&gt; guard(() =&gt; host.invokeMethod('cancel')),
+                child: const Text('Cancel'),
+              ),
+            if (pending &amp;&amp; !busy &amp;&amp; !recording)
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  TextButton(
+                    onPressed: () =&gt; guard(() async {
+                      processing = busy = true;
+                      refresh();
+                      try {
+                        await host.invokeMethod('retry');
+                      } catch (_) {
+                        busy = false;
+                        refresh();
+                        rethrow;
+                      }
+                    }),
+                    child: const Text('Retry recording'),
+                  ),
+                  TextButton(
+                    onPressed: () =&gt; guard(() =&gt; mutate('discard')),
+                    child: const Text('Discard'),
+                  ),
+                ],
+              ),
+          ],
+        ),
+      ),
+      bottomNavigationBar: Padding(
+        padding: EdgeInsets.only(
+          bottom: MediaQuery.viewInsetsOf(context).bottom,
+        ),
+        child: SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.all(8),
+            child: Row(
+              children: [
+                IconButton(
+                  onPressed: busy || recording ? null : () =&gt; guard(settings),
+                  icon: const Icon(Icons.settings),
+                  tooltip: 'Settings',
+                ),
+                Expanded(
+                  child: done
+                      ? const SizedBox()
+                      : recording
+                      ? level()
+                      : TextField(
+                          controller: draft,
+                          maxLength: 20000,
+                          decoration: const InputDecoration(
+                            hintText: 'Your task here…',
+                            counterText: '',
+                            border: OutlineInputBorder(),
+                          ),
+                        ),
+                ),
+                IconButton.filled(
+                  onPressed: busy &amp;&amp; draft.text.trim().isEmpty
+                      ? null
+                      : () =&gt; guard(primary),
+                  tooltip: done
+                      ? 'Erase all'
+                      : recording
+                      ? 'Stop'
+                      : draft.text.trim().isEmpty
+                      ? 'Record'
+                      : 'Add',
+                  icon: Icon(
+                    done
+                        ? Icons.delete
+                        : recording
+                        ? Icons.stop
+                        : draft.text.trim().isEmpty
+                        ? Icons.mic
+                        : Icons.add,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+  @override
+  void dispose() {
+    host.setMethodCallHandler(null);
+    activeScroll.dispose();
+    tabs.dispose();
+    draft.dispose();
+    meter.dispose();
+    super.dispose();
+  }
+}
+</pre><p>
+
+<a id="platform"></a>
+<h2>2. Android service boundary</h2>
+<p>The host is a FlutterActivity. Commands return a result to their caller. Progress, meter samples and hypotheses use reverse calls on the same channel.</p>
+<h3>Channel contract</h3>
+<table><thead><tr><th><a name="NWD1jSDbS-A">Caller</a></th><th>Operation</th><th>Result and ownership</th></tr></thead><tbody>
+<tr><td>Flutter</td><td><code>notes</code>, mutations</td><td>The host queries SQLite and returns a list of JSON records. Mutation calls complete after the write. Dart reloads the committed list.</td></tr>
+<tr><td>Flutter</td><td><code>present</code>, <code>download</code></td><td>The worker checks local assets or downloads and loads the model. Permission to record is requested separately, when starting capture.</td></tr>
+<tr><td>Flutter</td><td><code>record</code>, <code>test</code>, <code>stop</code>, <code>cancel</code></td><td>A successful start acknowledges microphone initialization. Stop requests completion. Its return does not imply inference has finished.</td></tr>
+<tr><td>Android</td><td><code>level</code>, <code>partial</code></td><td>RMS and elapsed seconds update the meter. Each partial string replaces the previous preview.</td></tr>
+<tr><td>Android</td><td><code>finishing</code>, <code>finished</code>, <code>ended</code></td><td>Finishing begins after the take is durable. Finished carries text and an optional edit target. Ended releases controls after cancellation, silence rejection or an error.</td></tr>
+<tr><td>Flutter</td><td><code>import</code>, <code>merge</code></td><td>The picker returns a document URI. The host validates its records and returns a count. User confirmation triggers a transaction that inserts missing IDs.</td></tr>
+</tbody></table>
+<p>The worker serializes native calls because capture, final flush and abort share a transcriber. UI events return to Android's main thread before crossing the channel. Manual stop and silence detection converge on the same completion path. When final processing is cancelled, the completed audio file remains available to retry.</p>
+
+<h3><a name="NWD1jSDbS-B">MainActivity.kt</a></h3>
+<p>Capture and speech have different scheduling needs. Android delivers platform commands on the UI thread. Capture owns its input thread and native inference uses one ordered worker.</p>
+<pre><a name="NW1jSDbS-17glJ0-1" href="#NWD1jSDbS-B"><dfn>&lt;file: android/app/src/main/kotlin/app/vnotes/MainActivity.kt&gt;=</dfn></a>
+<a name="NW1jSDbS-17glJ0-1-u1" href="#NWD1jSDbS-C"><i>&lt;Platform services&gt;</i></a>
+<a name="NW1jSDbS-17glJ0-1-u2" href="#NWD1jSDbS-D"><i>&lt;Channel dispatch&gt;</i></a>
+<a name="NW1jSDbS-17glJ0-1-u3" href="#NWD1jSDbS-E"><i>&lt;Recording pipeline&gt;</i></a>
+<a name="NW1jSDbS-17glJ0-1-u4" href="#NWD1jSDbS-F"><i>&lt;Completion and Android lifecycle&gt;</i></a>
+</pre><p>
+<h4><a name="NWD1jSDbS-C">Platform services</a></h4>
+<p>Keep one model engine and one serial worker per activity. Reuse the existing private database and settings namespace to support upgrades.</p>
+<pre><a name="NW1jSDbS-35lAkK-1" href="#NWD1jSDbS-C"><dfn>&lt;Platform services&gt;=</dfn></a> <b>(<a href="#NWD1jSDbS-B">&lt;-U</a>)</b>
+package app.vnotes
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodChannel
+import java.util.concurrent.Executors
+import org.json.JSONArray
+import org.json.JSONObject
+
+class MainActivity : FlutterActivity() {
+    private val worker = Executors.newSingleThreadExecutor()
+    private val store by lazy { NoteStore(this) }
+    private val speech by lazy { SpeechEngine(applicationContext) }
+    private val retry by lazy { RetryStore(this) }
+    private val prefs by lazy { getSharedPreferences(&quot;settings&quot;, MODE_PRIVATE) }
+    private lateinit var channel: MethodChannel
+    private var capture: AudioCapture? = null
+    private var activeSession: LiveSpeechSession? = null
+    private var permission: MethodChannel.Result? = null
+    private var picker: MethodChannel.Result? = null
+    private var imported = emptyList&lt;Note&gt;()
+    @Volatile private var closing = false
+    @Volatile private var cancelFinal = false
+    private var testing = false
+    private var busy = false
+
+    private fun event(name: String, value: Any?) = runOnUiThread {
+        if (!isDestroyed) channel.invokeMethod(name, value)
+    }
+
+</pre><p>
+<h4><a name="NWD1jSDbS-D">Channel dispatch</a></h4>
+<p>Task mutations address UUIDs. Model setup and retry run off the UI thread. Document operations delegate file access to the system picker.</p>
+<pre><a name="NW1jSDbS-426sLH-1" href="#NWD1jSDbS-D"><dfn>&lt;Channel dispatch&gt;=</dfn></a> <b>(<a href="#NWD1jSDbS-B">&lt;-U</a>)</b>
+    override fun configureFlutterEngine(engine: FlutterEngine) {
+        super.configureFlutterEngine(engine)
+        channel = MethodChannel(engine.dartExecutor.binaryMessenger, &quot;vnotes/android&quot;)
+        channel.setMethodCallHandler { call, result -&gt;
+            val args = call.arguments as? Map&lt;*, *&gt; ?: emptyMap&lt;String, Any&gt;()
+            fun note() = store.all().first { it.id == args[&quot;id&quot;] }
+            try {
+                when (call.method) {
+                    &quot;notes&quot; -&gt; result.success(store.all().map { it.json().toString() })
+                    &quot;add&quot; -&gt; {
+                        store.add(args[&quot;text&quot;] as String)
+                        result.success(null)
+                    }
+                    &quot;edit&quot; -&gt; {
+                        store.save(
+                            note()
+                                .copy(
+                                    text = args[&quot;text&quot;] as String,
+                                    updated = System.currentTimeMillis(),
+                                )
+                        )
+                        result.success(null)
+                    }
+                    &quot;move&quot; -&gt; {
+                        val n = note()
+                        val now = System.currentTimeMillis()
+                        store.save(
+                            n.copy(
+                                created = if (n.deleted == null) n.created else now,
+                                deleted = if (n.deleted == null) now else null,
+                            )
+                        )
+                        result.success(null)
+                    }
+                    &quot;undo&quot; -&gt; {
+                        store
+                            .all()
+                            .find { it.id == args[&quot;id&quot;] }
+                            ?.let {
+                                store.save(
+                                    it.copy(
+                                        created = (args[&quot;createdAt&quot;] as Number).toLong(),
+                                        deleted = (args[&quot;deletedAt&quot;] as? Number)?.toLong(),
+                                    )
+                                )
+                            }
+                        result.success(null)
+                    }
+                    &quot;merge&quot; -&gt; {
+                        store.merge(imported)
+                        imported = emptyList()
+                        result.success(null)
+                    }
+                    &quot;erase&quot; -&gt; {
+                        store.erase(note().id)
+                        result.success(null)
+                    }
+                    &quot;empty&quot; -&gt; {
+                        store.emptyDone()
+                        result.success(null)
+                    }
+                    &quot;settings&quot; -&gt;
+                        result.success(
+                            mapOf(
+                                &quot;threshold&quot; to prefs.getFloat(&quot;threshold&quot;, .01f).toDouble(),
+                                &quot;silence&quot; to prefs.getFloat(&quot;silence&quot;, 2f).toDouble(),
+                            )
+                        )
+                    &quot;configure&quot; -&gt; {
+                        prefs
+                            .edit()
+                            .putFloat(args[&quot;key&quot;] as String, (args[&quot;value&quot;] as Number).toFloat())
+                            .apply()
+                        result.success(null)
+                    }
+                    &quot;permission&quot; -&gt;
+                        if (
+                            checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+                                PackageManager.PERMISSION_GRANTED
+                        )
+                            result.success(true)
+                        else {
+                            check(permission == null)
+                            permission = result
+                            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 41)
+                        }
+                    &quot;present&quot;,
+                    &quot;download&quot; -&gt;
+                        worker.execute {
+                            try {
+                                if (call.method == &quot;download&quot;)
+                                    speech.setup { event(&quot;progress&quot;, it) }
+                                val present = speech.present()
+                                runOnUiThread { result.success(present) }
+                            } catch (e: Throwable) {
+                                runOnUiThread { result.error(&quot;model&quot;, e.message, null) }
+                            }
+                        }
+                    &quot;pending&quot; -&gt; result.success(retry.exists())
+                    &quot;discard&quot; -&gt; {
+                        check(!busy)
+                        retry.clear()
+                        result.success(null)
+                    }
+                    &quot;retry&quot; -&gt; {
+                        check(!busy)
+                        cancelFinal = false
+                        val take = requireNotNull(retry.load())
+                        busy = true
+                        worker.execute {
+                            try {
+                                deliver(
+                                    take,
+                                    speech.transcribe(take.audio) { event(&quot;progress&quot;, it) },
+                                )
+                            } catch (e: Throwable) {
+                                failed(e)
+                            }
+                        }
+                        result.success(null)
+                    }
+                    &quot;record&quot;,
+                    &quot;test&quot; -&gt; {
+                        start(call.method == &quot;test&quot;, args[&quot;id&quot;] as? String)
+                        result.success(null)
+                    }
+                    &quot;stop&quot;,
+                    &quot;cancel&quot; -&gt; {
+                        if (call.method == &quot;cancel&quot;) cancelFinal = true
+                        capture?.stop(call.method == &quot;cancel&quot;)
+                        result.success(null)
+                    }
+                    &quot;export&quot;,
+                    &quot;import&quot; -&gt; {
+                        check(picker == null)
+                        val exporting = call.method == &quot;export&quot;
+                        val intent =
+                            Intent(
+                                if (exporting) Intent.ACTION_CREATE_DOCUMENT
+                                else Intent.ACTION_OPEN_DOCUMENT
+                            )
+                        intent.type = &quot;application/json&quot;
+                        intent.addCategory(Intent.CATEGORY_OPENABLE)
+                        if (exporting) intent.putExtra(Intent.EXTRA_TITLE, &quot;vnotes-backup.json&quot;)
+                        startActivityForResult(intent, if (exporting) 51 else 52)
+                        picker = result
+                    }
+                    else -&gt; result.notImplemented()
+                }
+            } catch (e: Throwable) {
+                result.error(&quot;vnotes&quot;, e.message ?: e.javaClass.simpleName, null)
+            }
+        }
+    }
+
+</pre><p>
+<h4><a name="NWD1jSDbS-E">Recording pipeline</a></h4>
+<p>Capture immutable blocks and queue them in order. Store usable audio before finalizing. If live recognition fails, the saved take supports batch recognition.</p>
+<pre><a name="NW1jSDbS-2uoylw-1" href="#NWD1jSDbS-E"><dfn>&lt;Recording pipeline&gt;=</dfn></a> <b>(<a href="#NWD1jSDbS-B">&lt;-U</a>)</b>
+    private fun start(test: Boolean, target: String?) {
+        check(!busy &amp;&amp; capture == null)
+        if (!test) check(!retry.exists()) { &quot;Retry or discard the saved recording first&quot; }
+        val session =
+            if (test) null
+            else
+                LiveSpeechSession(
+                    worker,
+                    object : LiveSpeech {
+                        override fun start(onText: (String) -&gt; Unit) = speech.startLive(onText)
+
+                        override fun feed(audio: FloatArray) = speech.feedLive(audio)
+
+                        override fun finish() = speech.finishLive()
+
+                        override fun abort() = speech.abortLive()
+                    },
+                    { event(&quot;partial&quot;, it) },
+                    { event(&quot;progress&quot;, &quot;Live text paused. Recording continues.&quot;) },
+                )
+        activeSession = session
+        val input = AudioCapture()
+        cancelFinal = false
+        testing = test
+        busy = true
+        capture = input
+        try {
+            input.start(
+                test,
+                prefs.getFloat(&quot;silence&quot;, 2f).toDouble(),
+                prefs.getFloat(&quot;threshold&quot;, .01f).toDouble(),
+                onLevel = { rms, seconds, _ -&gt; event(&quot;level&quot;, listOf(rms, seconds)) },
+                onAudio = { session?.offer(it) },
+                onError = {
+                    session?.cancel()
+                    failed(it)
+                },
+                onDone = done@{ audio, usable, _ -&gt;
+                    if (closing) return@done
+                    if (audio == null || !usable) {
+                        session?.cancel()
+                        runOnUiThread {
+                            capture = null
+                            busy = false
+                            event(&quot;ended&quot;, if (audio != null) &quot;No speech detected&quot; else null)
+                        }
+                    } else {
+                        val take = PendingAudio(audio, target)
+                        try {
+                            retry.save(take)
+                            event(&quot;finishing&quot;, null)
+                            session!!.finish { outcome -&gt;
+                                try {
+                                    deliver(
+                                        take,
+                                        outcome.getOrElse {
+                                            speech.transcribe(audio) { event(&quot;progress&quot;, it) }
+                                        },
+                                    )
+                                } catch (e: Throwable) {
+                                    failed(e)
+                                }
+                            }
+                        } catch (e: Throwable) {
+                            session?.cancel()
+                            failed(e)
+                        }
+                    }
+                },
+            )
+        } catch (e: Throwable) {
+            session?.cancel()
+            busy = false
+            capture = null
+            throw e
+        }
+    }
+
+</pre><p>
+<h4><a name="NWD1jSDbS-F">Completion and Android lifecycle</a></h4>
+<p>A new take uses a stable ID for idempotent saving. Replacements return text to the review dialog. Merge imports by missing ID. Stop the microphone when the host leaves the foreground.</p>
+<pre><a name="NW1jSDbS-1F7EoK-1" href="#NWD1jSDbS-F"><dfn>&lt;Completion and Android lifecycle&gt;=</dfn></a> <b>(<a href="#NWD1jSDbS-B">&lt;-U</a>)</b>
+    private fun failed(e: Throwable) = runOnUiThread {
+        capture = null
+        busy = false
+        event(&quot;ended&quot;, e.message ?: e.javaClass.simpleName)
+    }
+
+    private fun deliver(take: PendingAudio, text: String) = runOnUiThread {
+        try {
+            if (isDestroyed) return@runOnUiThread
+            if (cancelFinal) {
+                busy = false
+                capture = null
+                event(&quot;ended&quot;, &quot;Recording kept for retry&quot;)
+                return@runOnUiThread
+            }
+            if (take.target == null) {
+                val now = System.currentTimeMillis()
+                store.save(Note(take.id, text, now, now, null))
+            }
+            retry.clear()
+            busy = false
+            capture = null
+            event(&quot;finished&quot;, mapOf(&quot;id&quot; to take.target, &quot;text&quot; to text))
+        } catch (e: Throwable) {
+            failed(e)
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        code: Int,
+        permissions: Array&lt;out String&gt;,
+        results: IntArray,
+    ) {
+        super.onRequestPermissionsResult(code, permissions, results)
+        if (code == 41) {
+            permission?.success(results.firstOrNull() == PackageManager.PERMISSION_GRANTED)
+            permission = null
+        }
+    }
+
+    override fun onActivityResult(code: Int, status: Int, data: Intent?) {
+        super.onActivityResult(code, status, data)
+        if (code !in 51..52) return
+        val result = picker ?: return
+        picker = null
+        val uri = data?.data
+        if (status != RESULT_OK || uri == null) {
+            result.success(null)
+            return
+        }
+        try {
+            if (code == 51) {
+                val json =
+                    JSONObject()
+                        .put(&quot;format&quot;, &quot;vnotes&quot;)
+                        .put(&quot;version&quot;, 1)
+                        .put(&quot;notes&quot;, JSONArray().apply { store.all().forEach { put(it.json()) } })
+                requireNotNull(contentResolver.openOutputStream(uri, &quot;wt&quot;)).bufferedWriter().use {
+                    it.write(json.toString())
+                }
+            } else {
+                val bytes = java.io.ByteArrayOutputStream()
+                requireNotNull(contentResolver.openInputStream(uri)).use { stream -&gt;
+                    val buf = ByteArray(8192)
+                    while (true) {
+                        val n = stream.read(buf)
+                        if (n &lt; 0) break
+                        require(bytes.size() + n &lt;= 10000000)
+                        bytes.write(buf, 0, n)
+                    }
+                }
+                imported = NoteStore.parseBackup(bytes.toString(&quot;UTF-8&quot;))
+                val ids = store.all().map { it.id }.toSet()
+                result.success(imported.count { it.id !in ids })
+                return
+            }
+            result.success(null)
+        } catch (e: Throwable) {
+            result.error(&quot;backup&quot;, e.message, null)
+        }
+    }
+
+    override fun onDestroy() {
+        closing = true
+        activeSession?.cancel()
+        capture?.stop(true)
+        worker.execute { speech.close() }
+        worker.shutdown()
+        store.close()
+        super.onDestroy()
+    }
+
+    override fun onStop() {
+        capture?.stop(testing, &quot;background&quot;)
+        super.onStop()
+    }
+}
+</pre><p>
+
+<a id="audio"></a>
+<h2><a name="NWD2toyka-G">3. Capture and recognition</a></h2>
+<p>Capture timings derive from sample counts at 16 kHz, so UI scheduling delays do not affect silence detection.</p>
+<p>For a block of N signed 16-bit samples, RMS is the square root of the mean squared normalized amplitude. The default threshold is 0.01. Accumulate 300 ms of above-threshold samples to arm automatic stop. Once armed, stop after the configured uninterrupted quiet interval (2 seconds by default). Counting samples avoids treating delayed callbacks as silence. The maximum take is 120 seconds, or 1,920,000 floats at 16 kHz. The full-take buffer costs about 7.7 MB before queued audio and inference memory.</p>
+<p>Model inference proceeds independently of capture. Slow inference can delay visible hypotheses while the microphone still captures every block. A manual stop flushes any backlog and the trailing phrase. Settings test mode measures the same signal path and skips inference.</p>
+
+<h3><a name="NWD2toyka-H">AudioCapture.kt</a></h3>
+<p>Read mono PCM16 from VOICE_RECOGNITION, normalize to floats and compute RMS for each 512-sample read. Keep at most 120 seconds. Test mode uses the same microphone path and omits the recording buffer.</p>
+<pre><a name="NW2toyka-1YyX87-1" href="#NWD2toyka-H"><dfn>&lt;file: android/app/src/main/kotlin/app/vnotes/AudioCapture.kt&gt;=</dfn></a>
+package app.vnotes
+
+import android.annotation.SuppressLint
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
+import kotlin.math.sqrt
+
+/** Native mono PCM capture. Test mode never retains PCM or invokes the model. */
+class AudioCapture {
+    private val running = AtomicBoolean(false)
+    private val cancelled = AtomicBoolean(false)
+    @Volatile private var recorder: AudioRecord? = null
+    @Volatile private var reason = &quot;manual&quot;
+    val active
+        get() = running.get()
+
+    @SuppressLint(&quot;MissingPermission&quot;)
+    fun start(
+        test: Boolean,
+        silence: Double,
+        threshold: Double,
+        onLevel: (Double, Double, Double) -&gt; Unit,
+        onDone: (FloatArray?, Boolean, String) -&gt; Unit,
+        onError: (Throwable) -&gt; Unit,
+        onAudio: (FloatArray) -&gt; Unit = {},
+    ) {
+        check(!running.get()) { &quot;Microphone is already running&quot; }
+        val minimum =
+            AudioRecord.getMinBufferSize(
+                RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+            )
+        check(minimum &gt; 0) { &quot;16 kHz microphone input is unavailable ($minimum)&quot; }
+        val input =
+            AudioRecord(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                maxOf(minimum * 2, 4096),
+            )
+        if (input.state != AudioRecord.STATE_INITIALIZED) {
+            input.release()
+            error(&quot;Android could not initialize the microphone&quot;)
+        }
+        recorder = input
+        cancelled.set(false)
+        reason = &quot;manual&quot;
+        try {
+            input.startRecording()
+            check(input.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                &quot;Microphone could not start&quot;
+            }
+        } catch (e: Throwable) {
+            input.release()
+            recorder = null
+            throw e
+        }
+        running.set(true)
+        thread(name = &quot;VNotes microphone&quot;) {
+            val vad = EnergyVad(RATE, silence, threshold)
+            val pcm = if (test) null else FloatArray(RATE * 120)
+            val block = ShortArray(512)
+            var size = 0
+            var failure: Throwable? = null
+            try {
+                while (running.get()) {
+                    val count = input.read(block, 0, block.size, AudioRecord.READ_BLOCKING)
+                    if (!running.get()) break
+                    check(count &gt; 0) {
+                        &quot;Microphone read failed ($count). Check Android microphone access.&quot;
+                    }
+                    val previousSize = size
+                    var energy = 0.0
+                    for (i in 0 until count) {
+                        val value = block[i] / 32768f
+                        energy += value * value
+                        if (pcm != null &amp;&amp; size &lt; pcm.size) pcm[size++] = value
+                    }
+                    if (!test &amp;&amp; size &gt; previousSize) onAudio(pcm!!.copyOfRange(previousSize, size))
+                    val rms = sqrt(energy / count)
+                    val autoStop = vad.push(rms, count)
+                    onLevel(rms, vad.totalMs / 1000, vad.quietMs / 1000)
+                    if (!test &amp;&amp; (autoStop || size == pcm!!.size)) {
+                        reason = if (autoStop) &quot;silence&quot; else &quot;limit&quot;
+                        running.set(false)
+                    }
+                }
+            } catch (e: Throwable) {
+                if (running.get()) failure = e
+            } finally {
+                running.set(false)
+                try {
+                    input.stop()
+                } catch (_: Exception) {}
+                input.release()
+                recorder = null
+            }
+            if (failure != null) onError(failure)
+            else {
+                val usable =
+                    vad.heard || (reason == &quot;manual&quot; &amp;&amp; vad.peak &gt; .0005 &amp;&amp; vad.totalMs &gt;= 150)
+                onDone(if (cancelled.get() || test) null else pcm!!.copyOf(size), usable, reason)
+            }
+        }
+    }
+
+    fun stop(cancel: Boolean = false, cause: String = &quot;manual&quot;) {
+        if (cancel) cancelled.set(true)
+        reason = cause
+        running.set(false)
+        try {
+            recorder?.stop()
+        } catch (_: Exception) {}
+    }
+
+    companion object {
+        const val RATE = 16000
+    }
+}
+</pre><p>
+<h3><a name="NWD2toyka-I">EnergyVad.kt</a></h3>
+<p>Accumulate above-threshold speech before arming the silence timer. A new above-threshold block resets the quiet interval. The batch splitter looks for quiet boundaries in long recordings and assigns each sample to one segment.</p>
+<pre><a name="NW2toyka-2y2Mbl-1" href="#NWD2toyka-I"><dfn>&lt;file: android/app/src/main/kotlin/app/vnotes/EnergyVad.kt&gt;=</dfn></a>
+package app.vnotes
+
+import kotlin.math.*
+
+class EnergyVad(
+    private val sampleRate: Int,
+    private val silenceSeconds: Double,
+    private val threshold: Double,
+) {
+    var speechMs = 0.0
+        private set
+
+    var quietMs = 0.0
+        private set
+
+    var peak = 0.0
+        private set
+
+    var totalMs = 0.0
+        private set
+
+    val heard
+        get() = speechMs &gt;= 300.0
+
+    fun push(rms: Double, count: Int): Boolean {
+        val ms = count * 1000.0 / sampleRate
+        totalMs += ms
+        peak = max(peak, rms)
+        if (rms &gt;= threshold) {
+            speechMs += ms
+            quietMs = 0.0
+        } else quietMs += ms
+        return heard &amp;&amp; quietMs &gt;= silenceSeconds * 1000.0
+    }
+
+    companion object {
+        fun threshold(position: Int) = (.1 * 10.0.pow(-position / 250.0)).coerceIn(.00001, .1)
+
+        fun position(threshold: Double) =
+            (-250 * log10(threshold / .1)).roundToInt().coerceIn(0, 1000)
+
+        fun level(rms: Double) =
+            ((20 * log10(max(.00001, rms)) + 100) / 100).coerceIn(0.0, 1.0).toFloat()
+    }
+}
+
+/** Prefer the quietest 250ms window between 12s and 20s; no samples overlap or disappear. */
+fun splitAudio(audio: FloatArray, rate: Int = 16000): List&lt;IntRange&gt; {
+    val ranges = ArrayList&lt;IntRange&gt;()
+    val maximum = 20 * rate
+    val window = rate / 4
+    var offset = 0
+    while (audio.size - offset &gt; maximum) {
+        var lowest = Double.POSITIVE_INFINITY
+        var best = offset + maximum
+        for (start in offset + 12 * rate..offset + maximum - window step window) {
+            var energy = 0.0
+            for (i in start until start + window) energy += audio[i] * audio[i]
+            if (energy &lt;= lowest) {
+                lowest = energy
+                best = start + window / 2
+            }
+        }
+        ranges.add(offset until best)
+        offset = best
+    }
+    if (offset &lt; audio.size) ranges.add(offset until audio.size)
+    return ranges
+}
+</pre><p>
+<h3><a name="NWD2toyka-J">LiveSpeechSession.kt</a></h3>
+<p>One serial executor orders start, immutable audio feeds, final flush and abort. Cancellation markers suppress queued recognition and late text callbacks. Bound queued samples by the maximum take size.</p>
+<pre><a name="NW2toyka-29zQcM-1" href="#NWD2toyka-J"><dfn>&lt;file: android/app/src/main/kotlin/app/vnotes/LiveSpeechSession.kt&gt;=</dfn></a>
+package app.vnotes
+
+import java.util.concurrent.CancellationException
+import java.util.concurrent.Executor
+
+interface LiveSpeech {
+    fun start(onText: (String) -&gt; Unit)
+
+    fun feed(audio: FloatArray)
+
+    /** Flush the trailing phrase and release this take’s native resources. */
+    fun finish(): String
+
+    fun abort()
+}
+
+/**
+ * Capture only enqueues immutable PCM. All model work stays on one serial executor. At most one
+ * 120-second take can be queued; cancellation skips queued inference immediately.
+ */
+class LiveSpeechSession(
+    private val executor: Executor,
+    private val engine: LiveSpeech,
+    private val onText: (String) -&gt; Unit,
+    private val onError: (Throwable) -&gt; Unit,
+    private val maxSamples: Int = 16000 * 120,
+) {
+    private val lock = Any()
+    @Volatile private var cancelled = false
+    @Volatile private var failure: Throwable? = null
+    @Volatile private var finished = false
+    private var ending = false
+    private var samples = 0
+
+    init {
+        executor.execute {
+            if (!cancelled)
+                try {
+                    engine.start { text -&gt;
+                        if (!cancelled &amp;&amp; !finished &amp;&amp; failure == null) onText(text)
+                    }
+                } catch (e: Throwable) {
+                    fail(e)
+                }
+        }
+    }
+
+    private fun fail(error: Throwable) {
+        synchronized(lock) {
+            if (failure == null &amp;&amp; !cancelled &amp;&amp; !finished) {
+                failure = error
+                onError(error)
+            }
+        }
+    }
+
+    fun offer(audio: FloatArray) {
+        synchronized(lock) {
+            if (ending || cancelled || failure != null || audio.isEmpty()) return
+            if (audio.size &gt; maxSamples - samples) {
+                fail(IllegalArgumentException(&quot;Live recording exceeds two minutes&quot;))
+                return
+            }
+            samples += audio.size
+            val copy = audio.copyOf()
+            executor.execute {
+                if (!cancelled &amp;&amp; failure == null)
+                    try {
+                        engine.feed(copy)
+                    } catch (e: Throwable) {
+                        fail(e)
+                    }
+            }
+        }
+    }
+
+    fun finish(onComplete: (Result&lt;String&gt;) -&gt; Unit) {
+        synchronized(lock) {
+            if (ending) return
+            ending = true
+            executor.execute {
+                val result =
+                    try {
+                        if (cancelled) throw CancellationException(&quot;Live transcription cancelled&quot;)
+                        failure?.let { throw it }
+                        Result.success(
+                            engine.finish().also {
+                                check(it.isNotBlank()) { &quot;No words detected in live recording&quot; }
+                            }
+                        )
+                    } catch (e: Throwable) {
+                        try {
+                            engine.abort()
+                        } catch (_: Throwable) {}
+                        Result.failure(e)
+                    }
+                finished = true
+                onComplete(
+                    if (cancelled)
+                        Result.failure(CancellationException(&quot;Live transcription cancelled&quot;))
+                    else result
+                )
+            }
+        }
+    }
+
+    fun cancel() {
+        synchronized(lock) {
+            if (cancelled || finished) return
+            cancelled = true
+            ending = true
+            executor.execute {
+                try {
+                    engine.abort()
+                } catch (_: Throwable) {} finally {
+                    finished = true
+                }
+            }
+        }
+    }
+}
+</pre><p>
+<h3><a name="NWD2toyka-K">LiveTranscript.kt</a></h3>
+<p>A line ID identifies a revisable hypothesis. Replace its text and order lines by start time to avoid appending duplicate partial words.</p>
+<pre><a name="NW2toyka-21LAHM-1" href="#NWD2toyka-K"><dfn>&lt;file: android/app/src/main/kotlin/app/vnotes/LiveTranscript.kt&gt;=</dfn></a>
+package app.vnotes
+
+/** Replace hypotheses by line ID: partial revisions must never duplicate earlier words. */
+class LiveTranscript {
+    private data class Line(val start: Float, val text: String)
+
+    private val lines = LinkedHashMap&lt;Long, Line&gt;()
+
+    fun update(id: Long, start: Float, text: String) {
+        lines[id] = Line(start, text.trim())
+    }
+
+    val text: String
+        get() =
+            lines.entries
+                .sortedWith(compareBy({ it.value.start }, { it.key }))
+                .map { it.value.text }
+                .filter { it.isNotBlank() }
+                .joinToString(&quot; &quot;)
+}
+</pre><p>
+<h3><a name="NWD2toyka-L">SpeechEngine.kt</a></h3>
+<p>Pin the English Tiny architecture and reuse its private model directory. Enable incomplete-line decoding during capture. Stop flushes trailing words. Closing the transcriber after each live take releases retained event audio.</p>
+<pre><a name="NW2toyka-1huSnl-1" href="#NWD2toyka-L"><dfn>&lt;file: android/app/src/main/kotlin/app/vnotes/SpeechEngine.kt&gt;=</dfn></a>
+package app.vnotes
+
+import ai.moonshine.voice.AssetDownloader
+import ai.moonshine.voice.JNI
+import ai.moonshine.voice.ModelSpec
+import ai.moonshine.voice.Transcriber
+import ai.moonshine.voice.TranscriberOption
+import ai.moonshine.voice.TranscriptEvent
+import ai.moonshine.voice.TranscriptLine
+import android.content.Context
+import java.io.File
+
+/** Call only on the single speech executor. Native inference never receives network audio. */
+class SpeechEngine(context: Context) {
+    private val root = File(context.filesDir, &quot;models/moonshine-tiny-en&quot;)
+    private val spec = ModelSpec.stt(&quot;en&quot;, JNI.MOONSHINE_MODEL_ARCH_TINY, false)
+    private val downloader = AssetDownloader()
+    private var engine: Transcriber? = null
+
+    fun present() = downloader.isModelPresent(root, spec)
+
+    fun setup(progress: (String) -&gt; Unit) {
+        root.mkdirs()
+        downloader.ensureModelPresent(root, spec) { name, index, total, done, bytes -&gt;
+            progress(&quot;$index/$total · $name&quot; + if (bytes &gt; 0) &quot; · ${done*100/bytes}%&quot; else &quot;&quot;)
+        }
+        load()
+        progress(&quot;Voice ready offline&quot;)
+    }
+
+    private fun load(): Transcriber {
+        engine?.let {
+            return it
+        }
+        check(present()) { &quot;Download the English model first&quot; }
+        val transcriber = Transcriber(listOf(TranscriberOption(&quot;decode_incomplete_lines&quot;, &quot;true&quot;)))
+        try {
+            transcriber.loadFromFiles(root.absolutePath, JNI.MOONSHINE_MODEL_ARCH_TINY)
+        } catch (e: Throwable) {
+            transcriber.close()
+            throw e
+        }
+        engine = transcriber
+        return transcriber
+    }
+
+    private var liveTranscript: LiveTranscript? = null
+
+    fun startLive(onText: (String) -&gt; Unit) {
+        val transcriber = load()
+        val transcript = LiveTranscript()
+        liveTranscript = transcript
+        var previous = &quot;&quot;
+        transcriber.removeAllListeners()
+        transcriber.setUpdateInterval(.5) // SDK adapts the cadence to actual inference cost.
+        transcriber.addListener { event -&gt;
+            val line: TranscriptLine? =
+                when (event) {
+                    is TranscriptEvent.LineStarted -&gt; event.line
+                    is TranscriptEvent.LineUpdated -&gt; event.line
+                    is TranscriptEvent.LineTextChanged -&gt; event.line
+                    is TranscriptEvent.LineCompleted -&gt; event.line
+                    is TranscriptEvent.Error -&gt; throw event.cause
+                    else -&gt; null
+                }
+            if (line != null) {
+                transcript.update(line.id, line.startTime, line.text.orEmpty())
+                val text = transcript.text
+                if (text != previous) {
+                    previous = text
+                    onText(text)
+                }
+            }
+        }
+        transcriber.start()
+    }
+
+    fun feedLive(audio: FloatArray) {
+        check(liveTranscript != null) { &quot;Live transcription has not started&quot; }
+        checkNotNull(engine).addAudio(audio, AudioCapture.RATE)
+    }
+
+    fun finishLive(): String {
+        try {
+            checkNotNull(engine)
+                .stop() // Force a final pass, including the trailing partial phrase.
+            return checkNotNull(liveTranscript).text.also {
+                check(it.isNotBlank()) { &quot;No words detected&quot; }
+            }
+        } finally {
+            abortLive()
+        }
+    }
+
+    fun abortLive() {
+        liveTranscript = null
+        // Close per take: SDK completed-line events retain PCM; do not accumulate them across
+        // notes.
+        val old = engine
+        engine = null
+        old?.removeAllListeners()
+        old?.close()
+    }
+
+    fun transcribe(audio: FloatArray, progress: (String) -&gt; Unit): String {
+        val transcriber = load()
+        val parts = ArrayList&lt;String&gt;()
+        val ranges = splitAudio(audio)
+        ranges.forEachIndexed { index, range -&gt;
+            progress(&quot;Transcribing ${index+1}/${ranges.size}…&quot;)
+            val text =
+                transcriber
+                    .transcribeWithoutStreaming(
+                        audio.copyOfRange(range.first, range.last + 1),
+                        AudioCapture.RATE,
+                    )
+                    .text()
+                    .trim()
+            if (text.isNotBlank()) parts.add(text)
+        }
+        return parts.joinToString(&quot; &quot;).also {
+            check(it.isNotBlank()) { &quot;No words detected. Retry or discard the recording.&quot; }
+        }
+    }
+
+    fun close() {
+        abortLive()
+    }
+}
+</pre><p>
+
+<a id="storage"></a>
+<h2><a name="NWD4ACTeW-M">4. Storage and recovery</a></h2>
+<p>SQLite stores tasks, shared preferences store audio settings, and an AtomicFile stores pending PCM. These records have different lifetimes.</p>
+
+<h3><a name="NWD4ACTeW-N">NoteStore.kt</a></h3>
+<p>Retain the existing Android schema and version-1 JSON interchange format.</p>
+<pre><a name="NW4ACTeW-4VshG-1" href="#NWD4ACTeW-N"><dfn>&lt;file: android/app/src/main/kotlin/app/vnotes/NoteStore.kt&gt;=</dfn></a>
+<a name="NW4ACTeW-4VshG-1-u1" href="#NWD4ACTeW-O"><i>&lt;Task records and import&gt;</i></a>
+<a name="NW4ACTeW-4VshG-1-u2" href="#NWD4ACTeW-P"><i>&lt;Pending audio format&gt;</i></a>
+</pre><p>
+<h4><a name="NWD4ACTeW-O">Task records and import</a></h4>
+<p>A null deletion timestamp selects TODO. Import validates sizes, identifiers and timestamps before inserting missing records in one transaction. Restore resets creation time so the task returns at the top.</p>
+<pre><a name="NW4ACTeW-351h2o-1" href="#NWD4ACTeW-O"><dfn>&lt;Task records and import&gt;=</dfn></a> <b>(<a href="#NWD4ACTeW-N">&lt;-U</a>)</b>
+package app.vnotes
+
+import android.content.ContentValues
+import android.content.Context
+import android.database.sqlite.SQLiteDatabase
+import android.database.sqlite.SQLiteOpenHelper
+import android.util.AtomicFile
+import java.io.*
+import java.util.UUID
+import org.json.JSONObject
+
+data class Note(
+    val id: String,
+    val text: String,
+    val created: Long,
+    val updated: Long,
+    val deleted: Long?,
+) {
+    fun json() =
+        JSONObject()
+            .put(&quot;id&quot;, id)
+            .put(&quot;text&quot;, text)
+            .put(&quot;createdAt&quot;, created)
+            .put(&quot;updatedAt&quot;, updated)
+            .put(&quot;deletedAt&quot;, deleted ?: JSONObject.NULL)
+}
+
+class NoteStore(context: Context) : SQLiteOpenHelper(context, &quot;vnotes.db&quot;, null, 1) {
+    override fun onCreate(db: SQLiteDatabase) {
+        db.execSQL(
+            &quot;CREATE TABLE notes(id TEXT PRIMARY KEY,text TEXT NOT NULL,created INTEGER NOT NULL,updated INTEGER NOT NULL,deleted INTEGER)&quot;
+        )
+    }
+
+    override fun onUpgrade(db: SQLiteDatabase, old: Int, new: Int) {
+        error(&quot;Unsupported database upgrade&quot;)
+    }
+
+    fun all(): List&lt;Note&gt; =
+        readableDatabase
+            .rawQuery(
+                &quot;SELECT id,text,created,updated,deleted FROM notes ORDER BY created DESC,rowid DESC&quot;,
+                null,
+            )
+            .use { c -&gt;
+                buildList {
+                    while (c.moveToNext()) add(
+                        Note(
+                            c.getString(0),
+                            c.getString(1),
+                            c.getLong(2),
+                            c.getLong(3),
+                            if (c.isNull(4)) null else c.getLong(4),
+                        )
+                    )
+                }
+            }
+
+    fun save(note: Note) {
+        val v =
+            ContentValues().apply {
+                put(&quot;id&quot;, note.id)
+                put(&quot;text&quot;, note.text)
+                put(&quot;created&quot;, note.created)
+                put(&quot;updated&quot;, note.updated)
+                if (note.deleted == null) putNull(&quot;deleted&quot;) else put(&quot;deleted&quot;, note.deleted)
+            }
+        check(
+            writableDatabase.insertWithOnConflict(
+                &quot;notes&quot;,
+                null,
+                v,
+                SQLiteDatabase.CONFLICT_REPLACE,
+            ) != -1L
+        ) {
+            &quot;Could not save note&quot;
+        }
+    }
+
+    fun add(text: String): Note {
+        val now = System.currentTimeMillis()
+        return Note(UUID.randomUUID().toString(), text, now, now, null).also(::save)
+    }
+
+    fun erase(id: String) {
+        writableDatabase.delete(&quot;notes&quot;, &quot;id=?&quot;, arrayOf(id))
+    }
+
+    fun emptyDone() {
+        writableDatabase.delete(&quot;notes&quot;, &quot;deleted IS NOT NULL&quot;, null)
+    }
+
+    fun merge(notes: List&lt;Note&gt;): Int {
+        val existing = all().map { it.id }.toSet()
+        val fresh = notes.filter { it.id !in existing }
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            fresh.forEach(::save)
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        return fresh.size
+    }
+
+    companion object {
+        fun parseBackup(text: String): List&lt;Note&gt; {
+            require(text.length &lt;= 10_000_000) { &quot;Backup exceeds 10 MB&quot; }
+            val json = JSONObject(text)
+            require(json.optString(&quot;format&quot;) == &quot;vnotes&quot; &amp;&amp; json.optInt(&quot;version&quot;) == 1) {
+                &quot;Unsupported backup format&quot;
+            }
+            val rows = json.getJSONArray(&quot;notes&quot;)
+            require(rows.length() &lt;= 50000) { &quot;Too many notes&quot; }
+            val ids = HashSet&lt;String&gt;()
+            return (0 until rows.length()).map { i -&gt;
+                val n = rows.getJSONObject(i)
+                fun stamp(key: String): Long {
+                    val v = n.getLong(key)
+                    require(v &gt; 0 &amp;&amp; v &lt; 8640000000000000L) { &quot;Invalid timestamp&quot; }
+                    return v
+                }
+                val id = n.getString(&quot;id&quot;)
+                val body = n.getString(&quot;text&quot;)
+                require(
+                    id.isNotBlank() &amp;&amp; ids.add(id) &amp;&amp; body.isNotBlank() &amp;&amp; body.length &lt;= 20000
+                ) {
+                    &quot;Invalid or duplicate note&quot;
+                }
+                Note(
+                    id,
+                    body,
+                    stamp(&quot;createdAt&quot;),
+                    stamp(&quot;updatedAt&quot;),
+                    if (n.isNull(&quot;deletedAt&quot;)) null else stamp(&quot;deletedAt&quot;),
+                )
+            }
+        }
+    }
+}
+
+</pre><p>
+<h4><a name="NWD4ACTeW-P">Pending audio format</a></h4>
+<p>Write a magic number, stable note ID, optional edit target, sample count and float PCM in big-endian order. Atomic replacement preserves the previous file if writing fails. Retry reuses the note ID so a repeated save cannot duplicate a task.</p>
+<pre><a name="NW4ACTeW-kyhAn-1" href="#NWD4ACTeW-P"><dfn>&lt;Pending audio format&gt;=</dfn></a> <b>(<a href="#NWD4ACTeW-N">&lt;-U</a>)</b>
+data class PendingAudio(
+    val audio: FloatArray,
+    val target: String?,
+    val id: String = UUID.randomUUID().toString(),
+)
+
+class RetryStore(context: Context) {
+    private val file = AtomicFile(File(context.filesDir, &quot;pending-audio.bin&quot;))
+
+    fun save(pending: PendingAudio) {
+        val stream = file.startWrite()
+        try {
+            val out = DataOutputStream(BufferedOutputStream(stream))
+            out.writeInt(0x564E4131)
+            out.writeUTF(pending.id)
+            out.writeUTF(pending.target ?: &quot;&quot;)
+            out.writeInt(pending.audio.size)
+            pending.audio.forEach { out.writeFloat(it) }
+            out.flush()
+            file.finishWrite(stream)
+        } catch (e: Throwable) {
+            file.failWrite(stream)
+            throw e
+        }
+    }
+
+    fun exists(): Boolean = file.baseFile.exists()
+
+    fun load(): PendingAudio? {
+        if (!file.baseFile.exists()) return null
+        return DataInputStream(file.openRead()).use { input -&gt;
+            require(input.readInt() == 0x564E4131) { &quot;Unsupported saved audio&quot; }
+            val noteId = input.readUTF()
+            val id = input.readUTF()
+            val size = input.readInt()
+            require(size in 1..AudioCapture.RATE * 120) { &quot;Invalid saved audio&quot; }
+            PendingAudio(FloatArray(size) { input.readFloat() }, id.ifEmpty { null }, noteId)
+        }
+    }
+
+    fun clear() = file.delete()
+}
+</pre><p>
+
+<a id="build"></a>
+<h2><a name="NWD49Hr7Q-Q">5. Build and verification</a></h2>
+<p>Use Flutter 3.47.9, JDK 17 and the SDK level selected by the Flutter Gradle extension. From code/ run flutter pub get, flutter analyze, flutter test, then flutter build apk --debug. On a device install the APK with adb install -r. A matching signing certificate and application ID allow Android to retain private storage. For hardware acceptance, download the model, enter airplane mode, dictate a note, wait for silence and verify the final phrase and the microphone indicator. Repeat with a recorded edit, Cancel, Retry and the settings meter.</p>
+
+<h3><a name="NWD49Hr7Q-R">pubspec.yaml</a></h3>
+<p>Flutter supplies Material widgets and the widget test framework. The build number exceeds that of the earlier Android release.</p>
+<pre><a name="NW49Hr7Q-36PhgS-1" href="#NWD49Hr7Q-R"><dfn>&lt;file: pubspec.yaml&gt;=</dfn></a>
+name: vnotes
+description: Offline English voice tasks for Android.
+publish_to: none
+version: 4.0.0+6
+environment:
+  sdk: ^3.13.0
+dependencies:
+  flutter:
+    sdk: flutter
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+flutter:
+  uses-material-design: true
+</pre><p>
+<h3><a name="NWD49Hr7Q-S">settings.gradle.kts</a></h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<pre><a name="NW49Hr7Q-4f7ROr-1" href="#NWD49Hr7Q-S"><dfn>&lt;file: android/settings.gradle.kts&gt;=</dfn></a>
+pluginManagement {
+    val flutterSdkPath =
+        run {
+            val properties = java.util.Properties()
+            file(&quot;local.properties&quot;).inputStream().use { properties.load(it) }
+            val flutterSdkPath = properties.getProperty(&quot;flutter.sdk&quot;)
+            require(flutterSdkPath != null) { &quot;flutter.sdk not set in local.properties&quot; }
+            flutterSdkPath
+        }
+
+    includeBuild(&quot;$flutterSdkPath/packages/flutter_tools/gradle&quot;)
+
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+plugins {
+    id(&quot;dev.flutter.flutter-plugin-loader&quot;) version &quot;1.0.0&quot;
+    id(&quot;com.android.application&quot;) version &quot;9.1.0&quot; apply false
+    id(&quot;org.jetbrains.kotlin.android&quot;) version &quot;2.4.0&quot; apply false
+}
+
+include(&quot;:app&quot;)
+</pre><p>
+<h3><a name="NWD49Hr7Q-T">build.gradle.kts</a></h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<pre><a name="NW49Hr7Q-YUTgz-1" href="#NWD49Hr7Q-T"><dfn>&lt;file: android/build.gradle.kts&gt;=</dfn></a>
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+val newBuildDir: Directory =
+    rootProject.layout.buildDirectory
+        .dir(&quot;../../build&quot;)
+        .get()
+rootProject.layout.buildDirectory.value(newBuildDir)
+
+subprojects {
+    val newSubprojectBuildDir: Directory = newBuildDir.dir(project.name)
+    project.layout.buildDirectory.value(newSubprojectBuildDir)
+}
+subprojects {
+    project.evaluationDependsOn(&quot;:app&quot;)
+}
+
+tasks.register&lt;Delete&gt;(&quot;clean&quot;) {
+    delete(rootProject.layout.buildDirectory)
+}
+</pre><p>
+<h3><a name="NWD49Hr7Q-U">build.gradle.kts</a></h3>
+<p>Keep app.vnotes and API 26 as the installation contract. The Moonshine Android SDK supplies JNI inference. The debug signing configuration supports the existing development certificate.</p>
+<pre><a name="NW49Hr7Q-2J4o8Z-1" href="#NWD49Hr7Q-U"><dfn>&lt;file: android/app/build.gradle.kts&gt;=</dfn></a>
+plugins {
+    id(&quot;com.android.application&quot;)
+    id(&quot;org.jetbrains.kotlin.android&quot;)
+    id(&quot;dev.flutter.flutter-gradle-plugin&quot;)
+}
+
+android {
+    namespace = &quot;app.vnotes&quot;
+    compileSdk = flutter.compileSdkVersion
+    ndkVersion = flutter.ndkVersion
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    defaultConfig {
+        applicationId = &quot;app.vnotes&quot;
+        minSdk = 26
+        targetSdk = flutter.targetSdkVersion
+        versionCode = flutter.versionCode
+        versionName = flutter.versionName
+    }
+    signingConfigs.getByName(&quot;debug&quot;) {
+        val existingKey = rootProject.file(&quot;.signing/debug.keystore&quot;)
+        if (existingKey.exists()) storeFile = existingKey
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+    }
+}
+flutter { source = &quot;../..&quot; }
+
+dependencies {
+    implementation(&quot;ai.moonshine:moonshine-voice:0.1.5&quot;)
+    testImplementation(&quot;junit:junit:4.13.2&quot;)
+}
+</pre><p>
+<h3><a name="NWD49Hr7Q-V">gradle.properties</a></h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<pre><a name="NW49Hr7Q-1FpEec-1" href="#NWD49Hr7Q-V"><dfn>&lt;file: android/gradle.properties&gt;=</dfn></a>
+org.gradle.jvmargs=-Xmx1024m -XX:MaxMetaspaceSize=512m -XX:ReservedCodeCacheSize=512m -XX:+HeapDumpOnOutOfMemoryError
+android.useAndroidX=true
+# This newDsl flag was added by the Flutter template
+android.newDsl=false
+# This builtInKotlin flag was added by the Flutter template
+android.builtInKotlin=false
+org.gradle.workers.max=1
+kotlin.compiler.execution.strategy=in-process
+</pre><p>
+<h3><a name="NWD49Hr7Q-W">gradle-wrapper.properties</a></h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<pre><a name="NW49Hr7Q-2EdQA8-1" href="#NWD49Hr7Q-W"><dfn>&lt;file: android/gradle/wrapper/gradle-wrapper.properties&gt;=</dfn></a>
+distributionBase=GRADLE_USER_HOME
+distributionPath=wrapper/dists
+zipStoreBase=GRADLE_USER_HOME
+zipStorePath=wrapper/dists
+distributionUrl=https\://services.gradle.org/distributions/gradle-9.3.1-all.zip
+</pre><p>
+<h3><a name="NWD49Hr7Q-X">AndroidManifest.xml</a></h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<pre><a name="NW49Hr7Q-3gbYUz-1" href="#NWD49Hr7Q-X"><dfn>&lt;file: android/app/src/debug/AndroidManifest.xml&gt;=</dfn></a>
+&lt;manifest xmlns:android=&quot;http://schemas.android.com/apk/res/android&quot;&gt;
+    &lt;!-- The INTERNET permission is required for development. Specifically,
+         the Flutter tool needs it to communicate with the running application
+         to allow setting breakpoints, to provide hot reload, etc.
+    --&gt;
+    &lt;uses-permission android:name=&quot;android.permission.INTERNET&quot;/&gt;
+&lt;/manifest&gt;
+</pre><p>
+<h3><a name="NWD49Hr7Q-Y">AndroidManifest.xml</a></h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<pre><a name="NW49Hr7Q-3s5DBt-1" href="#NWD49Hr7Q-Y"><dfn>&lt;file: android/app/src/main/AndroidManifest.xml&gt;=</dfn></a>
+&lt;manifest xmlns:android=&quot;http://schemas.android.com/apk/res/android&quot;&gt;
+    &lt;uses-permission android:name=&quot;android.permission.RECORD_AUDIO&quot;/&gt;
+    &lt;uses-permission android:name=&quot;android.permission.INTERNET&quot;/&gt;
+    &lt;application
+        android:label=&quot;VNotes&quot;
+        android:allowBackup=&quot;false&quot;
+        android:usesCleartextTraffic=&quot;false&quot;
+        android:name=&quot;${applicationName}&quot;
+        android:icon=&quot;@drawable/ic_launcher&quot;&gt;
+        &lt;activity
+            android:name=&quot;.MainActivity&quot;
+            android:exported=&quot;true&quot;
+            android:launchMode=&quot;singleTop&quot;
+            android:taskAffinity=&quot;&quot;
+            android:theme=&quot;@style/LaunchTheme&quot;
+            android:configChanges=&quot;orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode&quot;
+            android:hardwareAccelerated=&quot;true&quot;
+            android:windowSoftInputMode=&quot;adjustResize&quot;&gt;
+            &lt;!-- Specifies an Android theme to apply to this Activity as soon as
+                 the Android process has started. This theme is visible to the user
+                 while the Flutter UI initializes. After that, this theme continues
+                 to determine the Window background behind the Flutter UI. --&gt;
+            &lt;meta-data
+              android:name=&quot;io.flutter.embedding.android.NormalTheme&quot;
+              android:resource=&quot;@style/NormalTheme&quot;
+              /&gt;
+            &lt;intent-filter&gt;
+                &lt;action android:name=&quot;android.intent.action.MAIN&quot;/&gt;
+                &lt;category android:name=&quot;android.intent.category.LAUNCHER&quot;/&gt;
+            &lt;/intent-filter&gt;
+        &lt;/activity&gt;
+        &lt;!-- Don't delete the meta-data below.
+             This is used by the Flutter tool to generate GeneratedPluginRegistrant.java --&gt;
+        &lt;meta-data
+            android:name=&quot;flutterEmbedding&quot;
+            android:value=&quot;2&quot; /&gt;
+    &lt;/application&gt;
+    &lt;!-- Required to query activities that can process text, see:
+         https://developer.android.com/training/package-visibility and
+         https://developer.android.com/reference/android/content/Intent#ACTION_PROCESS_TEXT.
+
+         In particular, this is used by the Flutter engine in io.flutter.plugin.text.ProcessTextPlugin. --&gt;
+    &lt;queries&gt;
+        &lt;intent&gt;
+            &lt;action android:name=&quot;android.intent.action.PROCESS_TEXT&quot;/&gt;
+            &lt;data android:mimeType=&quot;text/plain&quot;/&gt;
+        &lt;/intent&gt;
+    &lt;/queries&gt;
+&lt;/manifest&gt;
+</pre><p>
+<h3><a name="NWD49Hr7Q-Z">ic_launcher.xml</a></h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<pre><a name="NW49Hr7Q-x9EH5-1" href="#NWD49Hr7Q-Z"><dfn>&lt;file: android/app/src/main/res/drawable/ic_launcher.xml&gt;=</dfn></a>
+&lt;vector xmlns:android=&quot;http://schemas.android.com/apk/res/android&quot; android:width=&quot;108dp&quot; android:height=&quot;108dp&quot; android:viewportWidth=&quot;108&quot; android:viewportHeight=&quot;108&quot;&gt;&lt;path android:fillColor=&quot;#B9EFC1&quot; android:pathData=&quot;M0,0h108v108h-108z&quot;/&gt;&lt;path android:strokeColor=&quot;#315B3B&quot; android:strokeWidth=&quot;8&quot; android:strokeLineCap=&quot;round&quot; android:strokeLineJoin=&quot;round&quot; android:fillColor=&quot;@android:color/transparent&quot; android:pathData=&quot;M29,35L50,75L72,35&quot;/&gt;&lt;path android:fillColor=&quot;#315B3B&quot; android:pathData=&quot;M83,29m-5,0a5,5 0,1 0,10 0a5,5 0,1 0,-10 0&quot;/&gt;&lt;/vector&gt;
+</pre><p>
+<h3><a name="NWD49Hr7Q-a">launch_background.xml</a></h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<pre><a name="NW49Hr7Q-2jilUo-1" href="#NWD49Hr7Q-a"><dfn>&lt;file: android/app/src/main/res/drawable/launch_background.xml&gt;=</dfn></a>
+&lt;?xml version=&quot;1.0&quot; encoding=&quot;utf-8&quot;?&gt;
+&lt;!-- Modify this file to customize your launch splash screen --&gt;
+&lt;layer-list xmlns:android=&quot;http://schemas.android.com/apk/res/android&quot;&gt;
+    &lt;item android:drawable=&quot;@android:color/white&quot; /&gt;
+
+    &lt;!-- You can insert your own image assets here --&gt;
+    &lt;!-- &lt;item&gt;
+        &lt;bitmap
+            android:gravity=&quot;center&quot;
+            android:src=&quot;@mipmap/launch_image&quot; /&gt;
+    &lt;/item&gt; --&gt;
+&lt;/layer-list&gt;
+</pre><p>
+<h3><a name="NWD49Hr7Q-b">launch_background.xml</a></h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<pre><a name="NW49Hr7Q-2Y1KWy-1" href="#NWD49Hr7Q-b"><dfn>&lt;file: android/app/src/main/res/drawable-v21/launch_background.xml&gt;=</dfn></a>
+&lt;?xml version=&quot;1.0&quot; encoding=&quot;utf-8&quot;?&gt;
+&lt;!-- Modify this file to customize your launch splash screen --&gt;
+&lt;layer-list xmlns:android=&quot;http://schemas.android.com/apk/res/android&quot;&gt;
+    &lt;item android:drawable=&quot;?android:colorBackground&quot; /&gt;
+
+    &lt;!-- You can insert your own image assets here --&gt;
+    &lt;!-- &lt;item&gt;
+        &lt;bitmap
+            android:gravity=&quot;center&quot;
+            android:src=&quot;@mipmap/launch_image&quot; /&gt;
+    &lt;/item&gt; --&gt;
+&lt;/layer-list&gt;
+</pre><p>
+<h3><a name="NWD49Hr7Q-c">styles.xml</a></h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<pre><a name="NW49Hr7Q-llm6x-1" href="#NWD49Hr7Q-c"><dfn>&lt;file: android/app/src/main/res/values/styles.xml&gt;=</dfn></a>
+&lt;?xml version=&quot;1.0&quot; encoding=&quot;utf-8&quot;?&gt;
+&lt;resources&gt;
+    &lt;!-- Theme applied to the Android Window while the process is starting when the OS's Dark Mode setting is off --&gt;
+    &lt;style name=&quot;LaunchTheme&quot; parent=&quot;@android:style/Theme.Light.NoTitleBar&quot;&gt;
+        &lt;!-- Show a splash screen on the activity. Automatically removed when
+             the Flutter engine draws its first frame --&gt;
+        &lt;item name=&quot;android:windowBackground&quot;&gt;@drawable/launch_background&lt;/item&gt;
+    &lt;/style&gt;
+    &lt;!-- Theme applied to the Android Window as soon as the process has started.
+         This theme determines the color of the Android Window while your
+         Flutter UI initializes, as well as behind your Flutter UI while its
+         running.
+
+         This Theme is only used starting with V2 of Flutter's Android embedding. --&gt;
+    &lt;style name=&quot;NormalTheme&quot; parent=&quot;@android:style/Theme.Light.NoTitleBar&quot;&gt;
+        &lt;item name=&quot;android:windowBackground&quot;&gt;?android:colorBackground&lt;/item&gt;
+    &lt;/style&gt;
+&lt;/resources&gt;
+</pre><p>
+<h3><a name="NWD49Hr7Q-d">styles.xml</a></h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<pre><a name="NW49Hr7Q-3uT4ZU-1" href="#NWD49Hr7Q-d"><dfn>&lt;file: android/app/src/main/res/values-night/styles.xml&gt;=</dfn></a>
+&lt;?xml version=&quot;1.0&quot; encoding=&quot;utf-8&quot;?&gt;
+&lt;resources&gt;
+    &lt;!-- Theme applied to the Android Window while the process is starting when the OS's Dark Mode setting is on --&gt;
+    &lt;style name=&quot;LaunchTheme&quot; parent=&quot;@android:style/Theme.Black.NoTitleBar&quot;&gt;
+        &lt;!-- Show a splash screen on the activity. Automatically removed when
+             the Flutter engine draws its first frame --&gt;
+        &lt;item name=&quot;android:windowBackground&quot;&gt;@drawable/launch_background&lt;/item&gt;
+    &lt;/style&gt;
+    &lt;!-- Theme applied to the Android Window as soon as the process has started.
+         This theme determines the color of the Android Window while your
+         Flutter UI initializes, as well as behind your Flutter UI while its
+         running.
+
+         This Theme is only used starting with V2 of Flutter's Android embedding. --&gt;
+    &lt;style name=&quot;NormalTheme&quot; parent=&quot;@android:style/Theme.Black.NoTitleBar&quot;&gt;
+        &lt;item name=&quot;android:windowBackground&quot;&gt;?android:colorBackground&lt;/item&gt;
+    &lt;/style&gt;
+&lt;/resources&gt;
+</pre><p>
+<h3><a name="NWD49Hr7Q-e">AndroidManifest.xml</a></h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<pre><a name="NW49Hr7Q-oJFeF-1" href="#NWD49Hr7Q-e"><dfn>&lt;file: android/app/src/profile/AndroidManifest.xml&gt;=</dfn></a>
+&lt;manifest xmlns:android=&quot;http://schemas.android.com/apk/res/android&quot;&gt;
+    &lt;!-- The INTERNET permission is required for development. Specifically,
+         the Flutter tool needs it to communicate with the running application
+         to allow setting breakpoints, to provide hot reload, etc.
+    --&gt;
+    &lt;uses-permission android:name=&quot;android.permission.INTERNET&quot;/&gt;
+&lt;/manifest&gt;
+</pre><p>
+<h3><a name="NWD49Hr7Q-f">notes_test.dart</a></h3>
+<p>Exercise text entry and animated tab changes with a channel double. Device acceptance separately covers AudioRecord, runtime permission and JNI inference.</p>
+<pre><a name="NW49Hr7Q-luPey-1" href="#NWD49Hr7Q-f"><dfn>&lt;file: test/notes_test.dart&gt;=</dfn></a>
+import 'dart:convert';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:vnotes/main.dart' as app;
+
+void main() {
+  testWidgets('typed note survives switching between Material tabs', (
+    tester,
+  ) async {
+    final rows = &lt;String&gt;[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(app.host, (
+      call,
+    ) async {
+      switch (call.method) {
+        case 'notes':
+          return rows;
+        case 'pending':
+          return false;
+        case 'present':
+          return true;
+        case 'settings':
+          return &lt;String, double&gt;{'threshold': .01, 'silence': 2};
+        case 'add':
+          rows.add(
+            jsonEncode({
+              'id': '1',
+              'text': call.arguments['text'],
+              'createdAt': 1,
+              'deletedAt': null,
+            }),
+          );
+      }
+      return null;
+    });
+    app.main();
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), 'Walk the dog');
+    await tester.pump();
+    await tester.tap(find.byTooltip('Add'));
+    await tester.pumpAndSettle();
+    expect(find.text('Walk the dog'), findsOneWidget);
+    await tester.tap(find.text('DONE'));
+    await tester.pumpAndSettle();
+    expect(find.text('Walk the dog'), findsNothing);
+    await tester.tap(find.text('TODO'));
+    await tester.pumpAndSettle();
+    expect(find.text('Walk the dog'), findsOneWidget);
+  });
+}
+</pre><p>
+<h3><a name="NWD49Hr7Q-g">EnergyVadTest.kt</a></h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<pre><a name="NW49Hr7Q-19DFUj-1" href="#NWD49Hr7Q-g"><dfn>&lt;file: android/app/src/test/kotlin/app/vnotes/EnergyVadTest.kt&gt;=</dfn></a>
+package app.vnotes
+import org.junit.Test
+import org.junit.Assert.*
+
+class EnergyVadTest {
+    @Test fun leadingSilenceAndClicksNeverArmAutoStop(){
+        val vad=EnergyVad(16000,.7,.01)
+        repeat(200){assertFalse(vad.push(0.0,512))}
+        assertFalse(vad.push(.5,512));repeat(100){assertFalse(vad.push(0.0,512))}
+    }
+    @Test fun speechArmsAndSilenceStopsAtActualSampleRate(){
+        for(rate in listOf(16000,44100,48000)){
+            val vad=EnergyVad(rate,.7,.01)
+            repeat(30){assertFalse(vad.push(.02,rate/100))}
+            assertTrue(vad.heard);repeat(69){assertFalse(vad.push(0.0,rate/100))};assertTrue(vad.push(0.0,rate/100))
+        }
+    }
+    @Test fun speechRestartsTheCountdown(){val vad=EnergyVad(16000,2.0,.01);vad.push(.02,4800);assertFalse(vad.push(0.0,16000));vad.push(.02,512);assertEquals(0.0,vad.quietMs,0.0);assertTrue(vad.push(0.0,32000))}
+    @Test fun sliderHasFullLogarithmicRange(){assertEquals(.1,EnergyVad.threshold(0),1e-10);assertEquals(.00001,EnergyVad.threshold(1000),1e-10);assertEquals(250,EnergyVad.position(.01));assertTrue(EnergyVad(16000,2.0,.00001).apply{push(.00002,4800)}.heard)}
+    @Test fun longNotesSplitWithoutSampleLoss(){val audio=FloatArray(16000*65){it.toFloat()};val ranges=splitAudio(audio);assertTrue(ranges.size&gt;1);assertEquals(audio.size,ranges.sumOf{it.count()});assertEquals(0,ranges.first().first);assertEquals(audio.lastIndex,ranges.last().last);ranges.zipWithNext().forEach{(a,b)-&gt;assertEquals(a.last+1,b.first)};assertTrue(ranges.all{it.count()&lt;=320000})}
+}
+</pre><p>
+<h3><a name="NWD49Hr7Q-h">LiveSpeechSessionTest.kt</a></h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<pre><a name="NW49Hr7Q-21XYBU-1" href="#NWD49Hr7Q-h"><dfn>&lt;file: android/app/src/test/kotlin/app/vnotes/LiveSpeechSessionTest.kt&gt;=</dfn></a>
+package app.vnotes
+
+import org.junit.Assert.*
+import org.junit.Test
+import java.util.ArrayDeque
+import java.util.concurrent.CancellationException
+import java.util.concurrent.Executor
+
+class LiveSpeechSessionTest {
+    private class SerialQueue : Executor {
+        val tasks = ArrayDeque&lt;Runnable&gt;()
+        override fun execute(command: Runnable) { tasks.add(command) }
+        fun next() { tasks.removeFirst().run() }
+        fun drain() { while(tasks.isNotEmpty())next() }
+    }
+    private class FakeEngine : LiveSpeech {
+        val events = ArrayList&lt;String&gt;(); val samples = ArrayList&lt;Float&gt;()
+        var onText: ((String)-&gt;Unit)? = null
+        var failFeed = false
+        override fun start(onText: (String) -&gt; Unit) { events.add(&quot;start&quot;); this.onText=onText }
+        override fun feed(audio: FloatArray) {
+            events.add(&quot;feed&quot;);if(failFeed)error(&quot;stream error&quot;)
+            samples.addAll(audio.toList());onText?.invoke(&quot;partial ${samples.size}&quot;)
+        }
+        override fun finish(): String { events.add(&quot;finish&quot;);onText?.invoke(&quot;final words&quot;);return &quot;final words&quot; }
+        override fun abort() { events.add(&quot;abort&quot;) }
+    }
+    @Test fun textBuildsBeforeStopAndFinalFlushFollowsEverySample() {
+        val q=SerialQueue();val engine=FakeEngine();val words=ArrayList&lt;String&gt;();var final:Result&lt;String&gt;?=null
+        val session=LiveSpeechSession(q,engine,{words.add(it)},{throw it})
+        val audio=floatArrayOf(1f,2f);session.offer(audio);audio[0]=99f
+        assertTrue(words.isEmpty());q.drain()
+        assertEquals(listOf(&quot;partial 2&quot;),words);assertEquals(listOf(1f,2f),engine.samples)
+        session.offer(floatArrayOf(3f));session.finish{final=it};session.offer(floatArrayOf(4f));q.drain()
+        assertEquals(listOf(&quot;start&quot;,&quot;feed&quot;,&quot;feed&quot;,&quot;finish&quot;),engine.events)
+        assertEquals(listOf(1f,2f,3f),engine.samples);assertEquals(&quot;final words&quot;,final!!.getOrThrow())
+        engine.onText?.invoke(&quot;late words&quot;);assertEquals(&quot;final words&quot;,words.last())
+        session.cancel();q.drain();assertFalse(engine.events.contains(&quot;abort&quot;))
+    }
+    @Test fun cancellingSkipsQueuedRecognitionAndAllLateText() {
+        val q=SerialQueue();val engine=FakeEngine();val words=ArrayList&lt;String&gt;()
+        val session=LiveSpeechSession(q,engine,{words.add(it)},{throw it})
+        q.next();session.offer(floatArrayOf(1f));session.cancel();session.offer(floatArrayOf(2f));q.drain()
+        engine.onText?.invoke(&quot;late words&quot;)
+        assertTrue(words.isEmpty());assertTrue(engine.samples.isEmpty());assertTrue(engine.events.contains(&quot;abort&quot;))
+    }
+    @Test fun cancelDuringFinishingStillCompletesWithoutSavingText() {
+        val q=SerialQueue();val engine=FakeEngine();var result:Result&lt;String&gt;?=null
+        val session=LiveSpeechSession(q,engine,{},{throw it});q.next()
+        session.offer(floatArrayOf(1f));session.finish{result=it};session.cancel();q.drain()
+        assertTrue(result!!.exceptionOrNull() is CancellationException)
+        assertFalse(engine.events.contains(&quot;finish&quot;));assertTrue(engine.events.contains(&quot;abort&quot;))
+    }
+    @Test fun liveFailureReturnsARecoverableResultForTheSavedAudioFallback() {
+        val q=SerialQueue();val engine=FakeEngine().apply{failFeed=true};val errors=ArrayList&lt;Throwable&gt;();var result:Result&lt;String&gt;?=null
+        val session=LiveSpeechSession(q,engine,{}, {errors.add(it)})
+        session.offer(floatArrayOf(1f));session.offer(floatArrayOf(2f));session.finish{result=it};q.drain()
+        assertEquals(1,errors.size);assertEquals(&quot;stream error&quot;,result!!.exceptionOrNull()!!.message)
+        assertEquals(1,engine.events.count{it==&quot;feed&quot;});assertTrue(engine.events.contains(&quot;abort&quot;))
+    }
+    @Test fun queueHasTheSameHardDurationLimitAsCapture() {
+        val q=SerialQueue();val engine=FakeEngine();val errors=ArrayList&lt;Throwable&gt;();var result:Result&lt;String&gt;?=null
+        val session=LiveSpeechSession(q,engine,{}, {errors.add(it)},maxSamples=2)
+        session.offer(floatArrayOf(1f,2f));session.offer(floatArrayOf(3f));session.finish{result=it};q.drain()
+        assertEquals(1,errors.size);assertTrue(result!!.isFailure);assertTrue(engine.samples.isEmpty())
+    }
+    @Test fun hypothesesReplaceWordsRatherThanAppendingDuplicates() {
+        val transcript=LiveTranscript()
+        transcript.update(1,0f,&quot;buy some&quot;);transcript.update(1,0f,&quot;buy some milk&quot;)
+        transcript.update(2,2f,&quot;and bread&quot;);transcript.update(1,0f,&quot;Buy milk&quot;)
+        assertEquals(&quot;Buy milk and bread&quot;,transcript.text)
+        transcript.update(2,2f,&quot;&quot;);assertEquals(&quot;Buy milk&quot;,transcript.text)
+        assertEquals(&quot;&quot;,LiveTranscript().text)
+    }
+}
+</pre><p>
+
+
+<ul>
+<li><a href="#NWD2ee5ue-4"><i>&lt;Application and controllers&gt;</i></a>: <a href="#NWD2ee5ue-3">U1</a>, <a href="#NWD2ee5ue-4">D2</a>
+<li><a href="#NWD1jSDbS-D"><i>&lt;Channel dispatch&gt;</i></a>: <a href="#NWD1jSDbS-B">U1</a>, <a href="#NWD1jSDbS-D">D2</a>
+<li><a href="#NWD1jSDbS-F"><i>&lt;Completion and Android lifecycle&gt;</i></a>: <a href="#NWD1jSDbS-B">U1</a>, <a href="#NWD1jSDbS-F">D2</a>
+<li><a href="#NWD2ee5ue-7"><i>&lt;Editing and shared action&gt;</i></a>: <a href="#NWD2ee5ue-3">U1</a>, <a href="#NWD2ee5ue-7">D2</a>
+<li><a href="#NWD2ee5ue-8"><i>&lt;Energy feedback and settings&gt;</i></a>: <a href="#NWD2ee5ue-3">U1</a>, <a href="#NWD2ee5ue-8">D2</a>
+<li><a href="#NWD49Hr7Q-U"><i>&lt;file: android/app/build.gradle.kts&gt;</i></a>: <a href="#NWD49Hr7Q-U">D1</a>
+<li><a href="#NWD49Hr7Q-X"><i>&lt;file: android/app/src/debug/AndroidManifest.xml&gt;</i></a>: <a href="#NWD49Hr7Q-X">D1</a>
+<li><a href="#NWD49Hr7Q-Y"><i>&lt;file: android/app/src/main/AndroidManifest.xml&gt;</i></a>: <a href="#NWD49Hr7Q-Y">D1</a>
+<li><a href="#NWD2toyka-H"><i>&lt;file: android/app/src/main/kotlin/app/vnotes/AudioCapture.kt&gt;</i></a>: <a href="#NWD2toyka-H">D1</a>
+<li><a href="#NWD2toyka-I"><i>&lt;file: android/app/src/main/kotlin/app/vnotes/EnergyVad.kt&gt;</i></a>: <a href="#NWD2toyka-I">D1</a>
+<li><a href="#NWD2toyka-J"><i>&lt;file: android/app/src/main/kotlin/app/vnotes/LiveSpeechSession.kt&gt;</i></a>: <a href="#NWD2toyka-J">D1</a>
+<li><a href="#NWD2toyka-K"><i>&lt;file: android/app/src/main/kotlin/app/vnotes/LiveTranscript.kt&gt;</i></a>: <a href="#NWD2toyka-K">D1</a>
+<li><a href="#NWD1jSDbS-B"><i>&lt;file: android/app/src/main/kotlin/app/vnotes/MainActivity.kt&gt;</i></a>: <a href="#NWD1jSDbS-B">D1</a>
+<li><a href="#NWD4ACTeW-N"><i>&lt;file: android/app/src/main/kotlin/app/vnotes/NoteStore.kt&gt;</i></a>: <a href="#NWD4ACTeW-N">D1</a>
+<li><a href="#NWD2toyka-L"><i>&lt;file: android/app/src/main/kotlin/app/vnotes/SpeechEngine.kt&gt;</i></a>: <a href="#NWD2toyka-L">D1</a>
+<li><a href="#NWD49Hr7Q-b"><i>&lt;file: android/app/src/main/res/drawable-v21/launch_background.xml&gt;</i></a>: <a href="#NWD49Hr7Q-b">D1</a>
+<li><a href="#NWD49Hr7Q-Z"><i>&lt;file: android/app/src/main/res/drawable/ic_launcher.xml&gt;</i></a>: <a href="#NWD49Hr7Q-Z">D1</a>
+<li><a href="#NWD49Hr7Q-a"><i>&lt;file: android/app/src/main/res/drawable/launch_background.xml&gt;</i></a>: <a href="#NWD49Hr7Q-a">D1</a>
+<li><a href="#NWD49Hr7Q-d"><i>&lt;file: android/app/src/main/res/values-night/styles.xml&gt;</i></a>: <a href="#NWD49Hr7Q-d">D1</a>
+<li><a href="#NWD49Hr7Q-c"><i>&lt;file: android/app/src/main/res/values/styles.xml&gt;</i></a>: <a href="#NWD49Hr7Q-c">D1</a>
+<li><a href="#NWD49Hr7Q-e"><i>&lt;file: android/app/src/profile/AndroidManifest.xml&gt;</i></a>: <a href="#NWD49Hr7Q-e">D1</a>
+<li><a href="#NWD49Hr7Q-g"><i>&lt;file: android/app/src/test/kotlin/app/vnotes/EnergyVadTest.kt&gt;</i></a>: <a href="#NWD49Hr7Q-g">D1</a>
+<li><a href="#NWD49Hr7Q-h"><i>&lt;file: android/app/src/test/kotlin/app/vnotes/LiveSpeechSessionTest.kt&gt;</i></a>: <a href="#NWD49Hr7Q-h">D1</a>
+<li><a href="#NWD49Hr7Q-T"><i>&lt;file: android/build.gradle.kts&gt;</i></a>: <a href="#NWD49Hr7Q-T">D1</a>
+<li><a href="#NWD49Hr7Q-V"><i>&lt;file: android/gradle.properties&gt;</i></a>: <a href="#NWD49Hr7Q-V">D1</a>
+<li><a href="#NWD49Hr7Q-W"><i>&lt;file: android/gradle/wrapper/gradle-wrapper.properties&gt;</i></a>: <a href="#NWD49Hr7Q-W">D1</a>
+<li><a href="#NWD49Hr7Q-S"><i>&lt;file: android/settings.gradle.kts&gt;</i></a>: <a href="#NWD49Hr7Q-S">D1</a>
+<li><a href="#NWD2ee5ue-3"><i>&lt;file: lib/main.dart&gt;</i></a>: <a href="#NWD2ee5ue-3">D1</a>
+<li><a href="#NWD49Hr7Q-R"><i>&lt;file: pubspec.yaml&gt;</i></a>: <a href="#NWD49Hr7Q-R">D1</a>
+<li><a href="#NWD49Hr7Q-f"><i>&lt;file: test/notes_test.dart&gt;</i></a>: <a href="#NWD49Hr7Q-f">D1</a>
+<li><a href="#NWD4ACTeW-P"><i>&lt;Pending audio format&gt;</i></a>: <a href="#NWD4ACTeW-N">U1</a>, <a href="#NWD4ACTeW-P">D2</a>
+<li><a href="#NWD1jSDbS-C"><i>&lt;Platform services&gt;</i></a>: <a href="#NWD1jSDbS-B">U1</a>, <a href="#NWD1jSDbS-C">D2</a>
+<li><a href="#NWD1jSDbS-E"><i>&lt;Recording pipeline&gt;</i></a>: <a href="#NWD1jSDbS-B">U1</a>, <a href="#NWD1jSDbS-E">D2</a>
+<li><a href="#NWD2ee5ue-5"><i>&lt;Startup and native events&gt;</i></a>: <a href="#NWD2ee5ue-3">U1</a>, <a href="#NWD2ee5ue-5">D2</a>
+<li><a href="#NWD2ee5ue-9"><i>&lt;Task pages and gestures&gt;</i></a>: <a href="#NWD2ee5ue-3">U1</a>, <a href="#NWD2ee5ue-9">D2</a>
+<li><a href="#NWD4ACTeW-O"><i>&lt;Task records and import&gt;</i></a>: <a href="#NWD4ACTeW-N">U1</a>, <a href="#NWD4ACTeW-O">D2</a>
+<li><a href="#NWD2ee5ue-6"><i>&lt;Voice and task commands&gt;</i></a>: <a href="#NWD2ee5ue-3">U1</a>, <a href="#NWD2ee5ue-6">D2</a>
+</ul>
+
+</body></html>

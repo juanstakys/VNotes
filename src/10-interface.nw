@@ -1,0 +1,632 @@
+@
+<a id="interface"></a>
+<h2>1. Flutter interaction model</h2>
+<p>A single screen owns two task projections and their shared composer. Material 3 supplies the component theme, tabs, cards, dialogs, settings and snackbar.</p>
+@
+<h3>main.dart</h3>
+<p>The widget coordinates short-lived presentation state. SQLite is the authority for task membership.</p>
+<<file: lib/main.dart>>=
+<<Application and controllers>>
+<<Startup and native events>>
+<<Voice and task commands>>
+<<Editing and shared action>>
+<<Energy feedback and settings>>
+<<Task pages and gestures>>
+@
+<h4>Application and controllers</h4>
+<p>Select Material 3 at application creation. Keep the draft controller alive across tab changes. A separate meter notifier limits audio-level redraws to its listener.</p>
+<<Application and controllers>>=
+import 'dart:convert';
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+void main() => runApp(
+  MaterialApp(
+    debugShowCheckedModeBanner: false,
+    theme: ThemeData(
+      useMaterial3: true,
+      colorSchemeSeed: const Color(0xff315b3b),
+    ),
+    home: const Notes(),
+  ),
+);
+
+typedef RowData = Map<String, dynamic>;
+const host = MethodChannel('vnotes/android');
+
+class Notes extends StatefulWidget {
+  const Notes({super.key});
+  @override
+  State<Notes> createState() => _NotesState();
+}
+
+class _NotesState extends State<Notes> with SingleTickerProviderStateMixin {
+  late final tabs = TabController(length: 2, vsync: this);
+  final activeScroll = ScrollController();
+  final draft = TextEditingController();
+  final meter = ValueNotifier<double>(0);
+  List<RowData> notes = [];
+  bool ready = false,
+      recording = false,
+      busy = false,
+      pending = false,
+      testing = false;
+  double threshold = .01, silence = 2;
+  int elapsed = 0;
+  bool processing = false;
+  String partial = '', status = '';
+  Offset? swipeStart;
+  bool get done => tabs.index == 1;
+
+@
+<h4>Startup and native events</h4>
+<p>Register the event handler before reading model presence and pending audio. Partial recognition is provisional. Only completion reloads durable notes or opens replacement review.</p>
+<<Startup and native events>>=
+  @override
+  void initState() {
+    super.initState();
+    tabs.addListener(refresh);
+    draft.addListener(refresh);
+    host.setMethodCallHandler(events);
+    guard(initialize);
+  }
+
+  void refresh() {
+    if (mounted) setState(() {});
+  }
+
+  void message(String text) {
+    if (mounted)
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  Future<void> guard(Future<void> Function() action) async {
+    try {
+      await action();
+    } catch (e) {
+      message(e.toString());
+    }
+  }
+
+  Future<void> load() async {
+    final rows = await host.invokeListMethod<String>('notes') ?? [];
+    notes = rows.map((s) => jsonDecode(s) as RowData).toList();
+    pending = await host.invokeMethod<bool>('pending') ?? false;
+    refresh();
+  }
+
+  Future<void> initialize() async {
+    await load();
+    final prefs = await host.invokeMapMethod<String, double>('settings');
+    threshold = prefs?['threshold'] ?? .01;
+    silence = prefs?['silence'] ?? 2;
+    ready = await host.invokeMethod<bool>('present') ?? false;
+    refresh();
+  }
+
+  Future<void> events(MethodCall call) async {
+    if (!mounted) return;
+    switch (call.method) {
+      case 'level':
+        final values = call.arguments as List;
+        elapsed = (values[1] as num).toInt();
+        meter.value = (values[0] as num).toDouble();
+        return;
+      case 'partial':
+        partial = call.arguments as String;
+      case 'progress':
+        status = call.arguments as String;
+      case 'finishing':
+        processing = true;
+        recording = false;
+        busy = true;
+        status = 'Finishing transcription…';
+      case 'ended':
+      case 'finished':
+        processing = busy = recording = testing = false;
+        partial = status = '';
+        meter.value = 0;
+        await load();
+        if (call.method == 'ended' && call.arguments != null)
+          message(call.arguments as String);
+        if (call.method == 'finished') {
+          final data = call.arguments as Map;
+          if (data['id'] != null)
+            await editText(
+              data['id'] as String,
+              data['text'] as String,
+              recorded: true,
+            );
+        }
+    }
+    refresh();
+  }
+
+@
+<h4>Voice and task commands</h4>
+<p>Request microphone permission on demand. Undo restores the previous timestamps for a surviving task, preserving any subsequent text edits.</p>
+<<Voice and task commands>>=
+  Future<void> download() async {
+    if (busy || recording) return;
+    setState(() {
+      busy = true;
+      status = 'Downloading English model…';
+    });
+    try {
+      ready = await host.invokeMethod<bool>('download') ?? false;
+    } finally {
+      busy = false;
+      status = '';
+      refresh();
+    }
+  }
+
+  Future<void> record({String? id, bool test = false}) async {
+    if (busy || recording || testing) return;
+    if (!test && !ready) {
+      message('Download the English voice model first');
+      return;
+    }
+    if (await host.invokeMethod<bool>('permission') != true) {
+      message('Microphone permission is required');
+      return;
+    }
+    await host.invokeMethod(test ? 'test' : 'record', {'id': id});
+    testing = test;
+    recording = !test;
+    partial = status = '';
+    meter.value = 0;
+    refresh();
+  }
+
+  Future<void> mutate(String op, [RowData? args]) async {
+    await host.invokeMethod(op, args);
+    await load();
+  }
+
+  Future<void> move(RowData n) async {
+    await mutate('move', n);
+    if (!mounted) return;
+    final bar = ScaffoldMessenger.of(context);
+    bar.clearSnackBars();
+    bar.showSnackBar(
+      SnackBar(
+        content: Text(
+          n['deletedAt'] == null ? 'Moved to DONE' : 'Restored to TODO',
+        ),
+        action: SnackBarAction(
+          label: 'UNDO',
+          onPressed: () => guard(() => mutate('undo', n)),
+        ),
+      ),
+    );
+  }
+
+@
+<h4>Editing and shared action</h4>
+<p>The item menu owns editing. Recording a replacement requires a second Save decision. Whitespace selects recording and trimmed text selects insertion.</p>
+<<Editing and shared action>>=
+  Future<bool> confirm(String title, String action) async =>
+      await showDialog<bool>(
+        context: context,
+        builder: (c) => AlertDialog(
+          title: Text(title),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(c, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(c, true),
+              child: Text(action),
+            ),
+          ],
+        ),
+      ) ??
+      false;
+  Future<void> editText(
+    String id,
+    String initial, {
+    bool recorded = false,
+  }) async {
+    String value = initial;
+    final text = await showDialog<String>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: Text(recorded ? 'Review recording' : 'Edit note'),
+        content: TextFormField(
+          initialValue: initial,
+          autofocus: true,
+          maxLines: 5,
+          maxLength: 20000,
+          onChanged: (s) => value = s,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(c),
+            child: const Text('Cancel'),
+          ),
+          if (recorded)
+            TextButton(
+              onPressed: () => Navigator.pop(c, ''),
+              child: const Text('Record again'),
+            ),
+          FilledButton(
+            onPressed: () {
+              if (value.trim().isNotEmpty) Navigator.pop(c, value.trim());
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (text == '' && recorded) {
+      await record(id: id);
+      return;
+    }
+    if (text != null) await mutate('edit', {'id': id, 'text': text});
+  }
+
+  Future<void> menu(String choice, RowData n) async {
+    if (choice == 'Edit') {
+      final mode = await showDialog<String>(
+        context: context,
+        builder: (c) => SimpleDialog(
+          title: const Text('Edit note'),
+          children: [
+            for (final m in ['Type', 'Record'])
+              SimpleDialogOption(
+                onPressed: () => Navigator.pop(c, m),
+                child: Text(m),
+              ),
+          ],
+        ),
+      );
+      if (mode == 'Type') await editText(n['id'], n['text']);
+      if (mode == 'Record') await record(id: n['id']);
+    } else if (choice == 'Erase forever') {
+      if (await confirm('Erase this note forever?', 'Erase'))
+        await mutate('erase', n);
+    } else {
+      await move(n);
+    }
+  }
+
+  Future<void> primary() async {
+    if (recording) {
+      await host.invokeMethod('stop');
+      return;
+    }
+    if (done) {
+      if (await confirm('Empty DONE?', 'Erase all')) await mutate('empty');
+      return;
+    }
+    final text = draft.text.trim();
+    if (text.isEmpty) {
+      await record();
+      return;
+    }
+    await mutate('add', {'text': text});
+    if(activeScroll.hasClients)activeScroll.jumpTo(0);
+    draft.clear();
+  }
+
+@
+<h4>Energy feedback and settings</h4>
+<p>The slider covers four decades of RMS amplitude. Persist the numeric threshold so changes in slider presentation do not change its meaning. A test capture emits energy readings and retains no take.</p>
+<<Energy feedback and settings>>=
+  Widget level({bool marker = false}) => ValueListenableBuilder<double>(
+    valueListenable: meter,
+    builder: (c, rms, _) {
+      double scale(double v) =>
+          (1 + math.log(math.max(v, .00001)) / math.ln10 / 5)
+              .clamp(0, 1)
+              .toDouble();
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          LinearProgressIndicator(value: scale(rms)),
+          if (!marker)
+            Text(
+              "${elapsed ~/ 60}:${(elapsed % 60).toString().padLeft(2, '0')}",
+            ),
+          if (marker)
+            Text(
+              '${rms >= threshold ? "Sound detected" : "Quiet"} · ${rms.toStringAsFixed(5)} RMS',
+            ),
+        ],
+      );
+    },
+  );
+  Future<void> settings() async {
+    await showDialog<void>(
+      context: context,
+      builder: (c) => StatefulBuilder(
+        builder: (c, update) => AlertDialog(
+          title: const Text('Settings'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                DropdownButton<double>(
+                  value: [.7, 1.0, 2.0, 3.0, 5.0].reduce(
+                    (a, b) => (a - silence).abs() < (b - silence).abs() ? a : b,
+                  ),
+                  items: [.7, 1.0, 2.0, 3.0, 5.0]
+                      .map(
+                        (v) => DropdownMenuItem(
+                          value: v,
+                          child: Text('Stop after ${v}s silence'),
+                        ),
+                      )
+                      .toList(),
+                  onChanged: (v) {
+                    if (v != null) {
+                      update(() => silence = v);
+                      guard(
+                        () => host.invokeMethod('configure', {
+                          'key': 'silence',
+                          'value': v,
+                        }),
+                      );
+                    }
+                  },
+                ),
+                const Text('Microphone sensitivity'),
+                Slider(
+                  value: (-math.log(threshold / .1) / math.ln10 / 4)
+                      .clamp(0, 1)
+                      .toDouble(),
+                  onChanged: (v) =>
+                      update(() => threshold = .1 * math.pow(10, -4 * v)),
+                  onChangeEnd: (_) => guard(
+                    () => host.invokeMethod('configure', {
+                      'key': 'threshold',
+                      'value': threshold,
+                    }),
+                  ),
+                ),
+                level(marker: true),
+                TextButton(
+                  onPressed: () => guard(() async {
+                    if (testing) {
+                      await host.invokeMethod('cancel');
+                      testing = false;
+                    } else {
+                      await record(test: true);
+                    }
+                    if (c.mounted) update(() {});
+                  }),
+                  child: Text(testing ? 'Stop test' : 'Test microphone'),
+                ),
+                for (final op in ['export', 'import'])
+                  TextButton(
+                    onPressed: () {
+                      Navigator.pop(c);
+                      guard(() async {
+                        if (op == 'export') {
+                          await mutate(op);
+                          return;
+                        }
+                        final count = await host.invokeMethod<int>('import');
+                        if (count != null &&
+                            await confirm('Import $count notes?', 'Import'))
+                          await mutate('merge');
+                      });
+                    },
+                    child: Text(
+                      op == 'export' ? 'Export backup' : 'Import backup',
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(c),
+              child: const Text('Done'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (testing) await host.invokeMethod('cancel');
+  }
+
+@
+<h4>Task pages and gestures</h4>
+<p>A minimum viewport height and bottom-aligned column anchor short lists. The card is the dismissible child, so its entire surface follows the drag. Manual tab navigation uses the tab controller for the slide animation.</p>
+<<Task pages and gestures>>=
+  Widget page(bool completed) {
+    final rows = notes
+        .where((n) => (n['deletedAt'] != null) == completed)
+        .toList();
+    final stamp = completed ? 'deletedAt' : 'createdAt';
+    rows.sort((a, b) => (b[stamp] as int).compareTo(a[stamp] as int));
+    return LayoutBuilder(
+      builder: (c, bounds) => SingleChildScrollView(
+        controller: completed ? null : activeScroll,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(minHeight: bounds.maxHeight),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              for (final n in rows)
+                Dismissible(
+                  key: ValueKey(n['id']),
+                  direction: completed
+                      ? DismissDirection.none
+                      : DismissDirection.startToEnd,
+                  confirmDismiss: (_) async {
+                    await guard(() => move(n));
+                    return false;
+                  },
+                  child: Card(
+                    child: ListTile(
+                      title: Text(n['text']),
+                      trailing: PopupMenuButton<String>(
+                        onSelected: (v) => guard(() => menu(v, n)),
+                        itemBuilder: (_) =>
+                            (completed
+                                    ? ['Restore', 'Erase forever']
+                                    : ['Edit', 'Done'])
+                                .map(
+                                  (s) =>
+                                      PopupMenuItem(value: s, child: Text(s)),
+                                )
+                                .toList(),
+                      ),
+                    ),
+                  ),
+                ),
+              if (!completed && !ready)
+                TextButton(
+                  onPressed: busy ? null : () => guard(download),
+                  child: const Text('Download English voice model'),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => Listener(
+    onPointerDown: (e) => swipeStart = e.position,
+    onPointerCancel: (_) => swipeStart = null,
+    onPointerUp: (e) {
+      final start = swipeStart;
+      swipeStart = null;
+      if (start == null || recording) return;
+      final delta = e.position - start;
+      if (delta.dx.abs() < 80 || delta.dx.abs() < delta.dy.abs() * 1.3) return;
+      if (!done && delta.dx < 0) tabs.animateTo(1);
+      if (done && delta.dx > 0) tabs.animateTo(0);
+    },
+    child: Scaffold(
+      body: SafeArea(
+        child: Column(
+          children: [
+            IgnorePointer(
+              ignoring: recording,
+              child: TabBar(
+                controller: tabs,
+                tabs: const [
+                  Tab(text: 'TODO'),
+                  Tab(text: 'DONE'),
+                ],
+              ),
+            ),
+            Expanded(
+              child: TabBarView(
+                controller: tabs,
+                physics: const NeverScrollableScrollPhysics(),
+                children: [page(false), page(true)],
+              ),
+            ),
+            if (partial.isNotEmpty) Text(partial, maxLines: 5),
+            if (status.isNotEmpty) Text(status),
+            if (recording || processing)
+              TextButton(
+                onPressed: () => guard(() => host.invokeMethod('cancel')),
+                child: const Text('Cancel'),
+              ),
+            if (pending && !busy && !recording)
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  TextButton(
+                    onPressed: () => guard(() async {
+                      processing = busy = true;
+                      refresh();
+                      try {
+                        await host.invokeMethod('retry');
+                      } catch (_) {
+                        busy = false;
+                        refresh();
+                        rethrow;
+                      }
+                    }),
+                    child: const Text('Retry recording'),
+                  ),
+                  TextButton(
+                    onPressed: () => guard(() => mutate('discard')),
+                    child: const Text('Discard'),
+                  ),
+                ],
+              ),
+          ],
+        ),
+      ),
+      bottomNavigationBar: Padding(
+        padding: EdgeInsets.only(
+          bottom: MediaQuery.viewInsetsOf(context).bottom,
+        ),
+        child: SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.all(8),
+            child: Row(
+              children: [
+                IconButton(
+                  onPressed: busy || recording ? null : () => guard(settings),
+                  icon: const Icon(Icons.settings),
+                  tooltip: 'Settings',
+                ),
+                Expanded(
+                  child: done
+                      ? const SizedBox()
+                      : recording
+                      ? level()
+                      : TextField(
+                          controller: draft,
+                          maxLength: 20000,
+                          decoration: const InputDecoration(
+                            hintText: 'Your task here…',
+                            counterText: '',
+                            border: OutlineInputBorder(),
+                          ),
+                        ),
+                ),
+                IconButton.filled(
+                  onPressed: busy && draft.text.trim().isEmpty
+                      ? null
+                      : () => guard(primary),
+                  tooltip: done
+                      ? 'Erase all'
+                      : recording
+                      ? 'Stop'
+                      : draft.text.trim().isEmpty
+                      ? 'Record'
+                      : 'Add',
+                  icon: Icon(
+                    done
+                        ? Icons.delete
+                        : recording
+                        ? Icons.stop
+                        : draft.text.trim().isEmpty
+                        ? Icons.mic
+                        : Icons.add,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+  @override
+  void dispose() {
+    host.setMethodCallHandler(null);
+    activeScroll.dispose();
+    tabs.dispose();
+    draft.dispose();
+    meter.dispose();
+    super.dispose();
+  }
+}
+@

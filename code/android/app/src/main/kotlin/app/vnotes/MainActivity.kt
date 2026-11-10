@@ -1,0 +1,363 @@
+package app.vnotes
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodChannel
+import java.util.concurrent.Executors
+import org.json.JSONArray
+import org.json.JSONObject
+
+class MainActivity : FlutterActivity() {
+    private val worker = Executors.newSingleThreadExecutor()
+    private val store by lazy { NoteStore(this) }
+    private val speech by lazy { SpeechEngine(applicationContext) }
+    private val retry by lazy { RetryStore(this) }
+    private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
+    private lateinit var channel: MethodChannel
+    private var capture: AudioCapture? = null
+    private var activeSession: LiveSpeechSession? = null
+    private var permission: MethodChannel.Result? = null
+    private var picker: MethodChannel.Result? = null
+    private var imported = emptyList<Note>()
+    @Volatile private var closing = false
+    @Volatile private var cancelFinal = false
+    private var testing = false
+    private var busy = false
+
+    private fun event(name: String, value: Any?) = runOnUiThread {
+        if (!isDestroyed) channel.invokeMethod(name, value)
+    }
+
+    override fun configureFlutterEngine(engine: FlutterEngine) {
+        super.configureFlutterEngine(engine)
+        channel = MethodChannel(engine.dartExecutor.binaryMessenger, "vnotes/android")
+        channel.setMethodCallHandler { call, result ->
+            val args = call.arguments as? Map<*, *> ?: emptyMap<String, Any>()
+            fun note() = store.all().first { it.id == args["id"] }
+            try {
+                when (call.method) {
+                    "notes" -> result.success(store.all().map { it.json().toString() })
+                    "add" -> {
+                        store.add(args["text"] as String)
+                        result.success(null)
+                    }
+                    "edit" -> {
+                        store.save(
+                            note()
+                                .copy(
+                                    text = args["text"] as String,
+                                    updated = System.currentTimeMillis(),
+                                )
+                        )
+                        result.success(null)
+                    }
+                    "move" -> {
+                        val n = note()
+                        val now = System.currentTimeMillis()
+                        store.save(
+                            n.copy(
+                                created = if (n.deleted == null) n.created else now,
+                                deleted = if (n.deleted == null) now else null,
+                            )
+                        )
+                        result.success(null)
+                    }
+                    "undo" -> {
+                        store
+                            .all()
+                            .find { it.id == args["id"] }
+                            ?.let {
+                                store.save(
+                                    it.copy(
+                                        created = (args["createdAt"] as Number).toLong(),
+                                        deleted = (args["deletedAt"] as? Number)?.toLong(),
+                                    )
+                                )
+                            }
+                        result.success(null)
+                    }
+                    "merge" -> {
+                        store.merge(imported)
+                        imported = emptyList()
+                        result.success(null)
+                    }
+                    "erase" -> {
+                        store.erase(note().id)
+                        result.success(null)
+                    }
+                    "empty" -> {
+                        store.emptyDone()
+                        result.success(null)
+                    }
+                    "settings" ->
+                        result.success(
+                            mapOf(
+                                "threshold" to prefs.getFloat("threshold", .01f).toDouble(),
+                                "silence" to prefs.getFloat("silence", 2f).toDouble(),
+                            )
+                        )
+                    "configure" -> {
+                        prefs
+                            .edit()
+                            .putFloat(args["key"] as String, (args["value"] as Number).toFloat())
+                            .apply()
+                        result.success(null)
+                    }
+                    "permission" ->
+                        if (
+                            checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+                                PackageManager.PERMISSION_GRANTED
+                        )
+                            result.success(true)
+                        else {
+                            check(permission == null)
+                            permission = result
+                            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 41)
+                        }
+                    "present",
+                    "download" ->
+                        worker.execute {
+                            try {
+                                if (call.method == "download")
+                                    speech.setup { event("progress", it) }
+                                val present = speech.present()
+                                runOnUiThread { result.success(present) }
+                            } catch (e: Throwable) {
+                                runOnUiThread { result.error("model", e.message, null) }
+                            }
+                        }
+                    "pending" -> result.success(retry.exists())
+                    "discard" -> {
+                        check(!busy)
+                        retry.clear()
+                        result.success(null)
+                    }
+                    "retry" -> {
+                        check(!busy)
+                        cancelFinal = false
+                        val take = requireNotNull(retry.load())
+                        busy = true
+                        worker.execute {
+                            try {
+                                deliver(
+                                    take,
+                                    speech.transcribe(take.audio) { event("progress", it) },
+                                )
+                            } catch (e: Throwable) {
+                                failed(e)
+                            }
+                        }
+                        result.success(null)
+                    }
+                    "record",
+                    "test" -> {
+                        start(call.method == "test", args["id"] as? String)
+                        result.success(null)
+                    }
+                    "stop",
+                    "cancel" -> {
+                        if (call.method == "cancel") cancelFinal = true
+                        capture?.stop(call.method == "cancel")
+                        result.success(null)
+                    }
+                    "export",
+                    "import" -> {
+                        check(picker == null)
+                        val exporting = call.method == "export"
+                        val intent =
+                            Intent(
+                                if (exporting) Intent.ACTION_CREATE_DOCUMENT
+                                else Intent.ACTION_OPEN_DOCUMENT
+                            )
+                        intent.type = "application/json"
+                        intent.addCategory(Intent.CATEGORY_OPENABLE)
+                        if (exporting) intent.putExtra(Intent.EXTRA_TITLE, "vnotes-backup.json")
+                        startActivityForResult(intent, if (exporting) 51 else 52)
+                        picker = result
+                    }
+                    else -> result.notImplemented()
+                }
+            } catch (e: Throwable) {
+                result.error("vnotes", e.message ?: e.javaClass.simpleName, null)
+            }
+        }
+    }
+
+    private fun start(test: Boolean, target: String?) {
+        check(!busy && capture == null)
+        if (!test) check(!retry.exists()) { "Retry or discard the saved recording first" }
+        val session =
+            if (test) null
+            else
+                LiveSpeechSession(
+                    worker,
+                    object : LiveSpeech {
+                        override fun start(onText: (String) -> Unit) = speech.startLive(onText)
+
+                        override fun feed(audio: FloatArray) = speech.feedLive(audio)
+
+                        override fun finish() = speech.finishLive()
+
+                        override fun abort() = speech.abortLive()
+                    },
+                    { event("partial", it) },
+                    { event("progress", "Live text paused. Recording continues.") },
+                )
+        activeSession = session
+        val input = AudioCapture()
+        cancelFinal = false
+        testing = test
+        busy = true
+        capture = input
+        try {
+            input.start(
+                test,
+                prefs.getFloat("silence", 2f).toDouble(),
+                prefs.getFloat("threshold", .01f).toDouble(),
+                onLevel = { rms, seconds, _ -> event("level", listOf(rms, seconds)) },
+                onAudio = { session?.offer(it) },
+                onError = {
+                    session?.cancel()
+                    failed(it)
+                },
+                onDone = done@{ audio, usable, _ ->
+                    if (closing) return@done
+                    if (audio == null || !usable) {
+                        session?.cancel()
+                        runOnUiThread {
+                            capture = null
+                            busy = false
+                            event("ended", if (audio != null) "No speech detected" else null)
+                        }
+                    } else {
+                        val take = PendingAudio(audio, target)
+                        try {
+                            retry.save(take)
+                            event("finishing", null)
+                            session!!.finish { outcome ->
+                                try {
+                                    deliver(
+                                        take,
+                                        outcome.getOrElse {
+                                            speech.transcribe(audio) { event("progress", it) }
+                                        },
+                                    )
+                                } catch (e: Throwable) {
+                                    failed(e)
+                                }
+                            }
+                        } catch (e: Throwable) {
+                            session?.cancel()
+                            failed(e)
+                        }
+                    }
+                },
+            )
+        } catch (e: Throwable) {
+            session?.cancel()
+            busy = false
+            capture = null
+            throw e
+        }
+    }
+
+    private fun failed(e: Throwable) = runOnUiThread {
+        capture = null
+        busy = false
+        event("ended", e.message ?: e.javaClass.simpleName)
+    }
+
+    private fun deliver(take: PendingAudio, text: String) = runOnUiThread {
+        try {
+            if (isDestroyed) return@runOnUiThread
+            if (cancelFinal) {
+                busy = false
+                capture = null
+                event("ended", "Recording kept for retry")
+                return@runOnUiThread
+            }
+            if (take.target == null) {
+                val now = System.currentTimeMillis()
+                store.save(Note(take.id, text, now, now, null))
+            }
+            retry.clear()
+            busy = false
+            capture = null
+            event("finished", mapOf("id" to take.target, "text" to text))
+        } catch (e: Throwable) {
+            failed(e)
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        code: Int,
+        permissions: Array<out String>,
+        results: IntArray,
+    ) {
+        super.onRequestPermissionsResult(code, permissions, results)
+        if (code == 41) {
+            permission?.success(results.firstOrNull() == PackageManager.PERMISSION_GRANTED)
+            permission = null
+        }
+    }
+
+    override fun onActivityResult(code: Int, status: Int, data: Intent?) {
+        super.onActivityResult(code, status, data)
+        if (code !in 51..52) return
+        val result = picker ?: return
+        picker = null
+        val uri = data?.data
+        if (status != RESULT_OK || uri == null) {
+            result.success(null)
+            return
+        }
+        try {
+            if (code == 51) {
+                val json =
+                    JSONObject()
+                        .put("format", "vnotes")
+                        .put("version", 1)
+                        .put("notes", JSONArray().apply { store.all().forEach { put(it.json()) } })
+                requireNotNull(contentResolver.openOutputStream(uri, "wt")).bufferedWriter().use {
+                    it.write(json.toString())
+                }
+            } else {
+                val bytes = java.io.ByteArrayOutputStream()
+                requireNotNull(contentResolver.openInputStream(uri)).use { stream ->
+                    val buf = ByteArray(8192)
+                    while (true) {
+                        val n = stream.read(buf)
+                        if (n < 0) break
+                        require(bytes.size() + n <= 10000000)
+                        bytes.write(buf, 0, n)
+                    }
+                }
+                imported = NoteStore.parseBackup(bytes.toString("UTF-8"))
+                val ids = store.all().map { it.id }.toSet()
+                result.success(imported.count { it.id !in ids })
+                return
+            }
+            result.success(null)
+        } catch (e: Throwable) {
+            result.error("backup", e.message, null)
+        }
+    }
+
+    override fun onDestroy() {
+        closing = true
+        activeSession?.cancel()
+        capture?.stop(true)
+        worker.execute { speech.close() }
+        worker.shutdown()
+        store.close()
+        super.onDestroy()
+    }
+
+    override fun onStop() {
+        capture?.stop(testing, "background")
+        super.onStop()
+    }
+}

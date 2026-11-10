@@ -1,0 +1,14 @@
+name: vnotes
+description: Offline English voice tasks for Android.
+publish_to: none
+version: 4.0.0+6
+environment:
+  sdk: ^3.13.0
+dependencies:
+  flutter:
+    sdk: flutter
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+flutter:
+  uses-material-design: true

@@ -1,0 +1,458 @@
+@
+<a id="build"></a>
+<h2>5. Build and verification</h2>
+<p>Use Flutter 3.47.9, JDK 17 and the SDK level selected by the Flutter Gradle extension. From code/ run flutter pub get, flutter analyze, flutter test, then flutter build apk --debug. On a device install the APK with adb install -r. A matching signing certificate and application ID allow Android to retain private storage. For hardware acceptance, download the model, enter airplane mode, dictate a note, wait for silence and verify the final phrase and the microphone indicator. Repeat with a recorded edit, Cancel, Retry and the settings meter.</p>
+@
+<h3>pubspec.yaml</h3>
+<p>Flutter supplies Material widgets and the widget test framework. The build number exceeds that of the earlier Android release.</p>
+<<file: pubspec.yaml>>=
+name: vnotes
+description: Offline English voice tasks for Android.
+publish_to: none
+version: 4.0.0+6
+environment:
+  sdk: ^3.13.0
+dependencies:
+  flutter:
+    sdk: flutter
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+flutter:
+  uses-material-design: true
+@
+<h3>settings.gradle.kts</h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<<file: android/settings.gradle.kts>>=
+pluginManagement {
+    val flutterSdkPath =
+        run {
+            val properties = java.util.Properties()
+            file("local.properties").inputStream().use { properties.load(it) }
+            val flutterSdkPath = properties.getProperty("flutter.sdk")
+            require(flutterSdkPath != null) { "flutter.sdk not set in local.properties" }
+            flutterSdkPath
+        }
+
+    includeBuild("$flutterSdkPath/packages/flutter_tools/gradle")
+
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+plugins {
+    id("dev.flutter.flutter-plugin-loader") version "1.0.0"
+    id("com.android.application") version "9.1.0" apply false
+    id("org.jetbrains.kotlin.android") version "2.4.0" apply false
+}
+
+include(":app")
+@
+<h3>build.gradle.kts</h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<<file: android/build.gradle.kts>>=
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+val newBuildDir: Directory =
+    rootProject.layout.buildDirectory
+        .dir("../../build")
+        .get()
+rootProject.layout.buildDirectory.value(newBuildDir)
+
+subprojects {
+    val newSubprojectBuildDir: Directory = newBuildDir.dir(project.name)
+    project.layout.buildDirectory.value(newSubprojectBuildDir)
+}
+subprojects {
+    project.evaluationDependsOn(":app")
+}
+
+tasks.register<Delete>("clean") {
+    delete(rootProject.layout.buildDirectory)
+}
+@
+<h3>build.gradle.kts</h3>
+<p>Keep app.vnotes and API 26 as the installation contract. The Moonshine Android SDK supplies JNI inference. The debug signing configuration supports the existing development certificate.</p>
+<<file: android/app/build.gradle.kts>>=
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("dev.flutter.flutter-gradle-plugin")
+}
+
+android {
+    namespace = "app.vnotes"
+    compileSdk = flutter.compileSdkVersion
+    ndkVersion = flutter.ndkVersion
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    defaultConfig {
+        applicationId = "app.vnotes"
+        minSdk = 26
+        targetSdk = flutter.targetSdkVersion
+        versionCode = flutter.versionCode
+        versionName = flutter.versionName
+    }
+    signingConfigs.getByName("debug") {
+        val existingKey = rootProject.file(".signing/debug.keystore")
+        if (existingKey.exists()) storeFile = existingKey
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+    }
+}
+flutter { source = "../.." }
+
+dependencies {
+    implementation("ai.moonshine:moonshine-voice:0.1.5")
+    testImplementation("junit:junit:4.13.2")
+}
+@
+<h3>gradle.properties</h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<<file: android/gradle.properties>>=
+org.gradle.jvmargs=-Xmx1024m -XX:MaxMetaspaceSize=512m -XX:ReservedCodeCacheSize=512m -XX:+HeapDumpOnOutOfMemoryError
+android.useAndroidX=true
+# This newDsl flag was added by the Flutter template
+android.newDsl=false
+# This builtInKotlin flag was added by the Flutter template
+android.builtInKotlin=false
+org.gradle.workers.max=1
+kotlin.compiler.execution.strategy=in-process
+@
+<h3>gradle-wrapper.properties</h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<<file: android/gradle/wrapper/gradle-wrapper.properties>>=
+distributionBase=GRADLE_USER_HOME
+distributionPath=wrapper/dists
+zipStoreBase=GRADLE_USER_HOME
+zipStorePath=wrapper/dists
+distributionUrl=https\://services.gradle.org/distributions/gradle-9.3.1-all.zip
+@
+<h3>AndroidManifest.xml</h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<<file: android/app/src/debug/AndroidManifest.xml>>=
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- The INTERNET permission is required for development. Specifically,
+         the Flutter tool needs it to communicate with the running application
+         to allow setting breakpoints, to provide hot reload, etc.
+    -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+</manifest>
+@
+<h3>AndroidManifest.xml</h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<<file: android/app/src/main/AndroidManifest.xml>>=
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <application
+        android:label="VNotes"
+        android:allowBackup="false"
+        android:usesCleartextTraffic="false"
+        android:name="${applicationName}"
+        android:icon="@drawable/ic_launcher">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:taskAffinity=""
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <!-- Specifies an Android theme to apply to this Activity as soon as
+                 the Android process has started. This theme is visible to the user
+                 while the Flutter UI initializes. After that, this theme continues
+                 to determine the Window background behind the Flutter UI. -->
+            <meta-data
+              android:name="io.flutter.embedding.android.NormalTheme"
+              android:resource="@style/NormalTheme"
+              />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+        <!-- Don't delete the meta-data below.
+             This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2" />
+    </application>
+    <!-- Required to query activities that can process text, see:
+         https://developer.android.com/training/package-visibility and
+         https://developer.android.com/reference/android/content/Intent#ACTION_PROCESS_TEXT.
+
+         In particular, this is used by the Flutter engine in io.flutter.plugin.text.ProcessTextPlugin. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT"/>
+            <data android:mimeType="text/plain"/>
+        </intent>
+    </queries>
+</manifest>
+@
+<h3>ic_launcher.xml</h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<<file: android/app/src/main/res/drawable/ic_launcher.xml>>=
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108"><path android:fillColor="#B9EFC1" android:pathData="M0,0h108v108h-108z"/><path android:strokeColor="#315B3B" android:strokeWidth="8" android:strokeLineCap="round" android:strokeLineJoin="round" android:fillColor="@android:color/transparent" android:pathData="M29,35L50,75L72,35"/><path android:fillColor="#315B3B" android:pathData="M83,29m-5,0a5,5 0,1 0,10 0a5,5 0,1 0,-10 0"/></vector>
+@
+<h3>launch_background.xml</h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<<file: android/app/src/main/res/drawable/launch_background.xml>>=
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Modify this file to customize your launch splash screen -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@android:color/white" />
+
+    <!-- You can insert your own image assets here -->
+    <!-- <item>
+        <bitmap
+            android:gravity="center"
+            android:src="@mipmap/launch_image" />
+    </item> -->
+</layer-list>
+@
+<h3>launch_background.xml</h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<<file: android/app/src/main/res/drawable-v21/launch_background.xml>>=
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Modify this file to customize your launch splash screen -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="?android:colorBackground" />
+
+    <!-- You can insert your own image assets here -->
+    <!-- <item>
+        <bitmap
+            android:gravity="center"
+            android:src="@mipmap/launch_image" />
+    </item> -->
+</layer-list>
+@
+<h3>styles.xml</h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<<file: android/app/src/main/res/values/styles.xml>>=
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Theme applied to the Android Window while the process is starting when the OS's Dark Mode setting is off -->
+    <style name="LaunchTheme" parent="@android:style/Theme.Light.NoTitleBar">
+        <!-- Show a splash screen on the activity. Automatically removed when
+             the Flutter engine draws its first frame -->
+        <item name="android:windowBackground">@drawable/launch_background</item>
+    </style>
+    <!-- Theme applied to the Android Window as soon as the process has started.
+         This theme determines the color of the Android Window while your
+         Flutter UI initializes, as well as behind your Flutter UI while its
+         running.
+
+         This Theme is only used starting with V2 of Flutter's Android embedding. -->
+    <style name="NormalTheme" parent="@android:style/Theme.Light.NoTitleBar">
+        <item name="android:windowBackground">?android:colorBackground</item>
+    </style>
+</resources>
+@
+<h3>styles.xml</h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<<file: android/app/src/main/res/values-night/styles.xml>>=
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Theme applied to the Android Window while the process is starting when the OS's Dark Mode setting is on -->
+    <style name="LaunchTheme" parent="@android:style/Theme.Black.NoTitleBar">
+        <!-- Show a splash screen on the activity. Automatically removed when
+             the Flutter engine draws its first frame -->
+        <item name="android:windowBackground">@drawable/launch_background</item>
+    </style>
+    <!-- Theme applied to the Android Window as soon as the process has started.
+         This theme determines the color of the Android Window while your
+         Flutter UI initializes, as well as behind your Flutter UI while its
+         running.
+
+         This Theme is only used starting with V2 of Flutter's Android embedding. -->
+    <style name="NormalTheme" parent="@android:style/Theme.Black.NoTitleBar">
+        <item name="android:windowBackground">?android:colorBackground</item>
+    </style>
+</resources>
+@
+<h3>AndroidManifest.xml</h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<<file: android/app/src/profile/AndroidManifest.xml>>=
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- The INTERNET permission is required for development. Specifically,
+         the Flutter tool needs it to communicate with the running application
+         to allow setting breakpoints, to provide hot reload, etc.
+    -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+</manifest>
+@
+<h3>notes_test.dart</h3>
+<p>Exercise text entry and animated tab changes with a channel double. Device acceptance separately covers AudioRecord, runtime permission and JNI inference.</p>
+<<file: test/notes_test.dart>>=
+import 'dart:convert';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:vnotes/main.dart' as app;
+
+void main() {
+  testWidgets('typed note survives switching between Material tabs', (
+    tester,
+  ) async {
+    final rows = <String>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(app.host, (
+      call,
+    ) async {
+      switch (call.method) {
+        case 'notes':
+          return rows;
+        case 'pending':
+          return false;
+        case 'present':
+          return true;
+        case 'settings':
+          return <String, double>{'threshold': .01, 'silence': 2};
+        case 'add':
+          rows.add(
+            jsonEncode({
+              'id': '1',
+              'text': call.arguments['text'],
+              'createdAt': 1,
+              'deletedAt': null,
+            }),
+          );
+      }
+      return null;
+    });
+    app.main();
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), 'Walk the dog');
+    await tester.pump();
+    await tester.tap(find.byTooltip('Add'));
+    await tester.pumpAndSettle();
+    expect(find.text('Walk the dog'), findsOneWidget);
+    await tester.tap(find.text('DONE'));
+    await tester.pumpAndSettle();
+    expect(find.text('Walk the dog'), findsNothing);
+    await tester.tap(find.text('TODO'));
+    await tester.pumpAndSettle();
+    expect(find.text('Walk the dog'), findsOneWidget);
+  });
+}
+@
+<h3>EnergyVadTest.kt</h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<<file: android/app/src/test/kotlin/app/vnotes/EnergyVadTest.kt>>=
+package app.vnotes
+import org.junit.Test
+import org.junit.Assert.*
+
+class EnergyVadTest {
+    @Test fun leadingSilenceAndClicksNeverArmAutoStop(){
+        val vad=EnergyVad(16000,.7,.01)
+        repeat(200){assertFalse(vad.push(0.0,512))}
+        assertFalse(vad.push(.5,512));repeat(100){assertFalse(vad.push(0.0,512))}
+    }
+    @Test fun speechArmsAndSilenceStopsAtActualSampleRate(){
+        for(rate in listOf(16000,44100,48000)){
+            val vad=EnergyVad(rate,.7,.01)
+            repeat(30){assertFalse(vad.push(.02,rate/100))}
+            assertTrue(vad.heard);repeat(69){assertFalse(vad.push(0.0,rate/100))};assertTrue(vad.push(0.0,rate/100))
+        }
+    }
+    @Test fun speechRestartsTheCountdown(){val vad=EnergyVad(16000,2.0,.01);vad.push(.02,4800);assertFalse(vad.push(0.0,16000));vad.push(.02,512);assertEquals(0.0,vad.quietMs,0.0);assertTrue(vad.push(0.0,32000))}
+    @Test fun sliderHasFullLogarithmicRange(){assertEquals(.1,EnergyVad.threshold(0),1e-10);assertEquals(.00001,EnergyVad.threshold(1000),1e-10);assertEquals(250,EnergyVad.position(.01));assertTrue(EnergyVad(16000,2.0,.00001).apply{push(.00002,4800)}.heard)}
+    @Test fun longNotesSplitWithoutSampleLoss(){val audio=FloatArray(16000*65){it.toFloat()};val ranges=splitAudio(audio);assertTrue(ranges.size>1);assertEquals(audio.size,ranges.sumOf{it.count()});assertEquals(0,ranges.first().first);assertEquals(audio.lastIndex,ranges.last().last);ranges.zipWithNext().forEach{(a,b)->assertEquals(a.last+1,b.first)};assertTrue(ranges.all{it.count()<=320000})}
+}
+@
+<h3>LiveSpeechSessionTest.kt</h3>
+<p>Android build or resource input. The file root gives its exact installation path.</p>
+<<file: android/app/src/test/kotlin/app/vnotes/LiveSpeechSessionTest.kt>>=
+package app.vnotes
+
+import org.junit.Assert.*
+import org.junit.Test
+import java.util.ArrayDeque
+import java.util.concurrent.CancellationException
+import java.util.concurrent.Executor
+
+class LiveSpeechSessionTest {
+    private class SerialQueue : Executor {
+        val tasks = ArrayDeque<Runnable>()
+        override fun execute(command: Runnable) { tasks.add(command) }
+        fun next() { tasks.removeFirst().run() }
+        fun drain() { while(tasks.isNotEmpty())next() }
+    }
+    private class FakeEngine : LiveSpeech {
+        val events = ArrayList<String>(); val samples = ArrayList<Float>()
+        var onText: ((String)->Unit)? = null
+        var failFeed = false
+        override fun start(onText: (String) -> Unit) { events.add("start"); this.onText=onText }
+        override fun feed(audio: FloatArray) {
+            events.add("feed");if(failFeed)error("stream error")
+            samples.addAll(audio.toList());onText?.invoke("partial ${samples.size}")
+        }
+        override fun finish(): String { events.add("finish");onText?.invoke("final words");return "final words" }
+        override fun abort() { events.add("abort") }
+    }
+    @Test fun textBuildsBeforeStopAndFinalFlushFollowsEverySample() {
+        val q=SerialQueue();val engine=FakeEngine();val words=ArrayList<String>();var final:Result<String>?=null
+        val session=LiveSpeechSession(q,engine,{words.add(it)},{throw it})
+        val audio=floatArrayOf(1f,2f);session.offer(audio);audio[0]=99f
+        assertTrue(words.isEmpty());q.drain()
+        assertEquals(listOf("partial 2"),words);assertEquals(listOf(1f,2f),engine.samples)
+        session.offer(floatArrayOf(3f));session.finish{final=it};session.offer(floatArrayOf(4f));q.drain()
+        assertEquals(listOf("start","feed","feed","finish"),engine.events)
+        assertEquals(listOf(1f,2f,3f),engine.samples);assertEquals("final words",final!!.getOrThrow())
+        engine.onText?.invoke("late words");assertEquals("final words",words.last())
+        session.cancel();q.drain();assertFalse(engine.events.contains("abort"))
+    }
+    @Test fun cancellingSkipsQueuedRecognitionAndAllLateText() {
+        val q=SerialQueue();val engine=FakeEngine();val words=ArrayList<String>()
+        val session=LiveSpeechSession(q,engine,{words.add(it)},{throw it})
+        q.next();session.offer(floatArrayOf(1f));session.cancel();session.offer(floatArrayOf(2f));q.drain()
+        engine.onText?.invoke("late words")
+        assertTrue(words.isEmpty());assertTrue(engine.samples.isEmpty());assertTrue(engine.events.contains("abort"))
+    }
+    @Test fun cancelDuringFinishingStillCompletesWithoutSavingText() {
+        val q=SerialQueue();val engine=FakeEngine();var result:Result<String>?=null
+        val session=LiveSpeechSession(q,engine,{},{throw it});q.next()
+        session.offer(floatArrayOf(1f));session.finish{result=it};session.cancel();q.drain()
+        assertTrue(result!!.exceptionOrNull() is CancellationException)
+        assertFalse(engine.events.contains("finish"));assertTrue(engine.events.contains("abort"))
+    }
+    @Test fun liveFailureReturnsARecoverableResultForTheSavedAudioFallback() {
+        val q=SerialQueue();val engine=FakeEngine().apply{failFeed=true};val errors=ArrayList<Throwable>();var result:Result<String>?=null
+        val session=LiveSpeechSession(q,engine,{}, {errors.add(it)})
+        session.offer(floatArrayOf(1f));session.offer(floatArrayOf(2f));session.finish{result=it};q.drain()
+        assertEquals(1,errors.size);assertEquals("stream error",result!!.exceptionOrNull()!!.message)
+        assertEquals(1,engine.events.count{it=="feed"});assertTrue(engine.events.contains("abort"))
+    }
+    @Test fun queueHasTheSameHardDurationLimitAsCapture() {
+        val q=SerialQueue();val engine=FakeEngine();val errors=ArrayList<Throwable>();var result:Result<String>?=null
+        val session=LiveSpeechSession(q,engine,{}, {errors.add(it)},maxSamples=2)
+        session.offer(floatArrayOf(1f,2f));session.offer(floatArrayOf(3f));session.finish{result=it};q.drain()
+        assertEquals(1,errors.size);assertTrue(result!!.isFailure);assertTrue(engine.samples.isEmpty())
+    }
+    @Test fun hypothesesReplaceWordsRatherThanAppendingDuplicates() {
+        val transcript=LiveTranscript()
+        transcript.update(1,0f,"buy some");transcript.update(1,0f,"buy some milk")
+        transcript.update(2,2f,"and bread");transcript.update(1,0f,"Buy milk")
+        assertEquals("Buy milk and bread",transcript.text)
+        transcript.update(2,2f,"");assertEquals("Buy milk",transcript.text)
+        assertEquals("",LiveTranscript().text)
+    }
+}
+@
