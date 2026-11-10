@@ -2,6 +2,12 @@
 
 Latest build: VNotes 3.3.1 (version code 5), package app.vnotes.
 
+## Android-only repository cleanup — 2026-11-09
+
+- Removed the browser app, its tests/assets/vendored dependencies and browser-specific reconstruction/validation documents.
+- Updated the README, Android guide and release instructions for the Android-only layout. Preserved the stable backup format and existing native build/install paths.
+- Native app sources, build configuration, signing key and the 3.3.1 APK are unchanged; no new application build is needed for this repository cleanup. Verification for this change checks remaining documentation links, removed-file references and the existing APK checksum.
+
 ## 3.3.1 sliding tabs and whole-card swipe — 2026-11-07
 
 - Final `assembleDebug testDebugUnitTest lintDebug` passed. All 21 tests pass with zero failures/errors: 16 signal/navigation/live-session tests and five native UI tests. Lint reports no errors.
@@ -19,7 +25,7 @@ Latest build: VNotes 3.3.1 (version code 5), package app.vnotes.
 - TextInputLayout children use LinearLayout.LayoutParams and its themed context; the tests caught and prevented a runtime field-construction failure before release. Material snackbar uses the library component anchored above composer controls; Original retains its existing bar. This snackbar behavior has not been exercised on hardware in this update.
 - Final APK v2 signature and 16KB-aware zip alignment verified. Package app.vnotes, version 3.3.0/code 4, minimum API26. Signing certificate matches the previous release, allowing in-place updates without clearing notes/settings/model files. Deliverable and SHA-256 updated in releases/.
 - No phone/emulator run was performed. On-device check both designs with short/overflowing TODO and DONE lists, new text/voice additions, scrolling, keyboard open, large font sizes, gestures, menus, edit/review dialogs, undo placement/action, recording feedback and model setup. Toggle both directions and relaunch to check persistence. Native microphone/transcription behavior is unchanged and still requires device testing.
-- Reconstruction guide documents viewport anchoring, Material component selection, shared behavior, palette resources, saved preference and recreation state. PWA files remain unchanged.
+- Reconstruction guide documents viewport anchoring, Material component selection, shared behavior, palette resources, saved preference and recreation state.
 
 ## 3.2 live transcription — 2026-11-07
 
@@ -42,16 +48,15 @@ The following baseline checks were completed for 3.0.0:
 
 ## Completed
 
-- Native Kotlin sources compiled with Kotlin 2.0.21, Android Gradle Plugin 8.7.3 and JDK 17. No WebView or browser capture bridge is used.
+- Native Kotlin sources compiled with Kotlin 2.0.21, Android Gradle Plugin 8.7.3 and JDK 17. The application uses native Android views and audio capture.
 - `assembleDebug testDebugUnitTest` succeeded. Five Kotlin unit tests passed, zero failures/errors: leading silence/click rejection, speech/minimum duration and silence stop at 16/44.1/48 kHz sample counts, quiet countdown reset, full logarithmic sensitivity range, and bounded lossless long-note segmentation.
 - Android lint passed after moving API27/API35 theme attributes into version-qualified resource folders. Remaining warnings concern English-only UI strings, optional backup configuration and minor view implementation suggestions; no lint errors.
-- Preserved PWA tests pass after moving source into web/.
 - APK manifest verified with Android build tools: app.vnotes, 3.0.0, minimum SDK 26, target SDK 35, launcher VNotes.
 - APK v2 signature verified by apksigner. Certificate is the standard-form local Android debug identity, not a production identity. Local key is preserved under ignored android/.signing/ for future compatible test updates.
 - APK archive contains compiled DEX, manifest/resources, and Moonshine/JNI/ONNX Runtime .so files for ARM64, ARMv7 and x86-64.
 - APK zip alignment verified. All three ARM64 native libraries have 16KB-aligned ELF LOAD segments.
 - APK copied to releases/vnotes-android-debug.apk; SHA-256 in releases/SHA256SUMS.
-- Original PWA source preserved under web/, native source under android/, build helper under scripts/, separate reconstruction guides under docs/.
+- Native source under android/, build helper under scripts/, Android reconstruction and validation guides under docs/.
 
 ## Verification limits
 
@@ -65,7 +70,7 @@ On the phone, verify:
 4. English Tiny download completion/error/retry and recording/transcription online, then cold airplane-mode relaunch and a new transcription after download.
 5. Silence auto-stop, quiet/noisy speech, manual stop, Cancel, 2-minute cap and app backgrounding. Confirm microphone privacy indicator clears.
 6. Recorded replacement review/cancel/save, failed-audio retry across restart, cooperative transcription cancel.
-7. Swipe/row menus/Undo/erase confirmations, file-picker backups and import from PWA JSON without duplicates.
+7. Swipe/row menus/Undo/erase confirmations, file-picker backups and JSON backup import without duplicates.
 8. Keyboard resizing, display/font sizes, TalkBack and orientation.
 
-Model files are downloaded by the native SDK during setup and are not included in the APK. The existing browser model cache is intentionally not shared. Export browser notes and import their JSON backup to migrate user data.
+Model files are downloaded by the native SDK during setup and are not included in the APK. Transfer notes between installations using JSON backup export/import.

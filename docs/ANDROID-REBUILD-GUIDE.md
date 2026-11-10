@@ -1,6 +1,6 @@
 # VNotes native Android reconstruction guide
 
-Version 3.3.1. This guide describes the Kotlin port independently of the PWA guide. A programmer can rebuild the native application without an LLM. The original PWA lives under `web/`, with its original code preserved; native Android is the primary project under `android/`.
+Version 3.3.1. This standalone guide describes the native Kotlin Android application so a programmer can rebuild it without an LLM. The repository contains the Android project under `android/`, build tooling under `scripts/`, APK deliverables under `releases/`, and reconstruction/validation documentation under `docs/`.
 
 ## Product and visual contract
 
@@ -8,11 +8,11 @@ Keep the approved minimalist sketch: white background, two equal top tabs TODO/D
 
 Both lists anchor their content at the bottom of the available scroll viewport while short, leaving unused space above. New additions appear at the top of that bottom-anchored group and grow it upward. Once the group exceeds the viewport, use normal vertical scrolling, keeping newest first and scrolling to the top on additions/import/tab changes. Implement with ScrollView.fillViewport=true and a single vertical LinearLayout child with gravity=BOTTOM; do not reverse the data or reverse the scroll origin. Active notes sort newest first. Type-add trims outside whitespace and preserves internal newlines; text limit 20,000 characters. Editing preserves list position. Completing a note moves it to DONE. DONE is soft deletion, sorted by latest completion. Restore sets creation time to now so it appears at top. Swipe right on an active item -> mark DONE. Swipe left anywhere in the main Activity (including blank space, rows, tabs and composer) -> switch to DONE. Swipe right anywhere in DONE -> switch to TODO, with no restoration/deletion side effects. Left in DONE does nothing. Editing is only available through the item ellipsis menu -> Edit -> Type/Record; tapping the row itself does not open the edit menu. Restore and individual permanent erase use the DONE ellipsis menu; the bottom trash button erases all DONE notes with confirmation. A non-modal snackbar immediately above the input follows reversible moves, with its UNDO button aligned right. Canceling edit/record does not alter the original. Recorded replacement opens editable review with Save, Record again and Cancel.
 
-English recognition, no accounts/analytics/sync/cloud inference. Initial model download is allowed, then app works offline. Notes are private to the app. Export/import backups use Android's system document picker. Export the PWA JSON and import it into Android to transfer data; browser storage cannot be read directly by the native application.
+English recognition, no accounts/analytics/sync/cloud inference. Initial model download is allowed, then app works offline. Notes are private to the app. Export/import backups use Android's system document picker. Import/export uses the versioned JSON backup format described below.
 
 ## Build and packaging contract
 
-Use Kotlin and native Android views, not WebView, HTML, JavaScript, Compose or a browser-dependent capture API. Use AppCompatActivity and programmatic native views with explicit androidx.appcompat:appcompat:1.6.1 and com.google.android.material:material:1.10.0 dependencies (already compatible with the speech SDK). Original mode uses simple LinearLayout/ScrollView/EditText/Button controls and AppCompat dialogs; Material mode uses real Material components. Native speech SDK also brings AndroidX/OkHttp dependencies.
+Use Kotlin with native Android views and AppCompatActivity and programmatic native views with explicit androidx.appcompat:appcompat:1.6.1 and com.google.android.material:material:1.10.0 dependencies (already compatible with the speech SDK). Original mode uses simple LinearLayout/ScrollView/EditText/Button controls and AppCompat dialogs; Material mode uses real Material components. Native speech SDK also brings AndroidX/OkHttp dependencies.
 
 Pinned tools: JDK 17, Gradle 8.9, Android Gradle Plugin 8.7.3, Kotlin 2.0.21, compile/target SDK 35, min SDK 26 (Android 8.0). Dependency: `ai.moonshine:moonshine-voice:0.1.5`. Repository sources: Google Maven, Maven Central, Gradle plugin portal. Use the Gradle wrapper under android/. The build helper generates a standard debug signing key once in ignored android/.signing/debug.keystore, builds/tests, copies the APK into releases/ and records SHA-256. Keep this key for compatible future debug upgrades; production needs a separate private release key. Debug credentials are the public Android standard and provide no release identity.
 
@@ -34,7 +34,7 @@ Theme is a light native no-action-bar theme, white system bars on API27+ and gre
 - res/drawable/ic_launcher.xml: vector launcher monogram. res/values/styles.xml: native light theme.
 - src/test/.../EnergyVadTest.kt: pure signal/duration/segmentation regressions.
 
-The app does not require an HTTP server, adb reverse, Chrome, Firefox or WASM. ADB is only an optional installation/logging/testing tool.
+ADB is an optional installation/logging/testing tool. Build and run the app with the Android toolchain described above.
 
 ## Native audio and energy VAD
 
@@ -50,7 +50,7 @@ No AudioTrack, microphone loopback, native speech recognition intent or cloud AP
 
 ## Moonshine native setup and inference
 
-Use the official native Android SDK rather than porting Transformers.js. Native models are ORT-format assets and tokenizer data, distinct from the web ONNX model cache. Construct `ModelSpec.stt("en", JNI.MOONSHINE_MODEL_ARCH_TINY, false)` to choose the original small English Tiny architecture explicitly and omit spelling/diarization extras. Model root: filesDir/models/moonshine-tiny-en.
+Use the official Moonshine native Android SDK. Native models are ORT-format assets and tokenizer data. Construct `ModelSpec.stt("en", JNI.MOONSHINE_MODEL_ARCH_TINY, false)` to choose the original small English Tiny architecture explicitly and omit spelling/diarization extras. Model root: filesDir/models/moonshine-tiny-en.
 
 Call AssetDownloader.isModelPresent(root,spec) on the speech executor during initial startup. This resolves the compiled native file catalog and checks local files. Initial setup calls ensureModelPresent(root,spec,progressListener), whose HTTPS transfers use .part files, support HTTP Range resume, check space, and rename completed downloads. Display file progress on the main thread. Then construct `Transcriber(listOf(TranscriberOption("decode_incomplete_lines","true")))` and loadFromFiles(root.absolutePath, JNI.MOONSHINE_MODEL_ARCH_TINY). Explicit incomplete-line decoding makes the existing Tiny model produce hypotheses before speech ends. Declare setup successful only after loading succeeds. Keep all native methods on one executor. The engine is closed after each live take because the SDK retains completed-line event PCM; later takes reload from local model files without another network download. Also close it when the Activity shuts down after queued work.
 
@@ -68,7 +68,7 @@ SharedPreferences file settings contains float threshold and silence, plus boole
 
 RetryStore uses Android AtomicFile at filesDir/pending-audio.bin. Format: big-endian int magic0x564E4131; Java DataOutput UTF note UUID; UTF edit target UUID or empty; int sample count; sampleCount float32 values in big-endian. Valid size 1..1920000. The note UUID is generated when creating the pending take and remains stable across retries; insert/replace by that same ID prevents duplicate notes if cleanup is interrupted after save. For an edit, target identifies the existing note and the transcript is reviewed before changing it. Successful transcription/review handoff clears the retry file; unsuccessful/cancelled inference retains it. Discard deletes it explicitly. Never create an empty note or lose typed draft before successful SQLite write.
 
-Backup JSON retains the PWA format: format="vnotes", version=1, notes=[{id,text,createdAt,updatedAt,deletedAt}], settings={silence,threshold}. Export via ACTION_CREATE_DOCUMENT. Import via ACTION_OPEN_DOCUMENT, read at most ~10MB into memory with an explicit bounded loop compatible with API26. Validate count<=50000, unique nonblank IDs, nonblank text<=20000, finite positive date-range timestamps, null deletedAt or valid timestamp. Preview the count of missing IDs before import. Browser data does not migrate implicitly. Export files are user-owned outside app-private storage and survive uninstall.
+Use the stable version-1 backup JSON format: format="vnotes", version=1, notes=[{id,text,createdAt,updatedAt,deletedAt}], settings={silence,threshold}. Export via ACTION_CREATE_DOCUMENT. Import via ACTION_OPEN_DOCUMENT, read at most ~10MB into memory with an explicit bounded loop compatible with API26. Validate count<=50000, unique nonblank IDs, nonblank text<=20000, finite positive date-range timestamps, null deletedAt or valid timestamp. Preview the count of missing IDs before import. Export files are user-owned outside app-private storage and survive uninstall.
 
 ## Rebuild sequence and acceptance
 
@@ -79,7 +79,7 @@ Backup JSON retains the PWA format: format="vnotes", version=1, notes=[{id,text,
 5. Add runtime permission, AudioRecord capture/test and deterministic cleanup.
 6. Add native Moonshine downloader/load/offline inference on a single executor.
 7. Build debug APK, run tests, verify signing/manifest/ABIs, record checksum and install on a real phone.
-8. Verify cold airplane-mode relaunch/transcription after setup, Android permissions denied/granted, soft/noisy speech, manual stop/silence/cancel/two-minute/background behavior, recorded-edit review, swipe/menus, backups/PWA migration, process restart with retry audio, keyboard layout, TalkBack and large text.
+8. Verify cold airplane-mode relaunch/transcription after setup, Android permissions denied/granted, soft/noisy speech, manual stop/silence/cancel/two-minute/background behavior, recorded-edit review, swipe/menus, backup export/import, process restart with retry audio, keyboard layout, TalkBack and large text.
 
 Compilation/JVM tests do not verify phone microphone hardware or actual Android JNI inference. Record observed checks and limits in ANDROID-VALIDATION.md; never imply device validation from an APK build alone.
 
@@ -130,3 +130,8 @@ Before another transition or app backgrounding, invalidate the previous completi
 Build each item as one outer view. Material mode uses the MaterialCardView containing the row; Original uses a vertical wrapper containing the row and its separator. Observe TODO-body drag events on the inner row, but set translationX on this outer view. That moves text, ellipsis menu, background, border and separator together. Preserve existing direction/vertical-intent/80dp completion rules; reset translation on up/cancel/multiple pointers. Permanent erase and edit remain menu/button actions. A successful completion saves the note and displays the existing undo snackbar.
 
 UI regressions exercise full-card translation, cancellation restoring it, successful completion, both slide directions in both designs, and rapid tab reversal leaving exactly one page at translation zero. Existing state-restoration tests also remain required.
+
+
+## Android-only repository (2026-11-09)
+
+Maintain the native app, native tests, Android build helper, APK/checksum and these standalone Android documents. The browser implementation, its tests and vendored runtime, and its separate reconstruction/validation documents were removed. Keep the existing version-1 JSON backup parser and format compatible with previously exported backups. Repository cleanup does not change the application ID, signing key, data schema, model storage or APK version.
