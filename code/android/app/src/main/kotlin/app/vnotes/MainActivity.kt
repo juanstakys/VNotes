@@ -320,6 +320,12 @@ class MainActivity : FlutterActivity() {
                     JSONObject()
                         .put("format", "vnotes")
                         .put("version", 1)
+                        .put(
+                            "settings",
+                            JSONObject()
+                                .put("silence", prefs.getFloat("silence", 2f).toDouble())
+                                .put("threshold", prefs.getFloat("threshold", .01f).toDouble()),
+                        )
                         .put("notes", JSONArray().apply { store.all().forEach { put(it.json()) } })
                 requireNotNull(contentResolver.openOutputStream(uri, "wt")).bufferedWriter().use {
                     it.write(json.toString())

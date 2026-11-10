@@ -1009,6 +1009,12 @@ class MainActivity : FlutterActivity() {
                     JSONObject()
                         .put(&quot;format&quot;, &quot;vnotes&quot;)
                         .put(&quot;version&quot;, 1)
+                        .put(
+                            &quot;settings&quot;,
+                            JSONObject()
+                                .put(&quot;silence&quot;, prefs.getFloat(&quot;silence&quot;, 2f).toDouble())
+                                .put(&quot;threshold&quot;, prefs.getFloat(&quot;threshold&quot;, .01f).toDouble()),
+                        )
                         .put(&quot;notes&quot;, JSONArray().apply { store.all().forEach { put(it.json()) } })
                 requireNotNull(contentResolver.openOutputStream(uri, &quot;wt&quot;)).bufferedWriter().use {
                     it.write(json.toString())
@@ -1748,6 +1754,9 @@ class RetryStore(context: Context) {
 <a id="build"></a>
 <h2><a name="NWD49Hr7Q-Q">5. Build and verification</a></h2>
 <p>Use Flutter 3.47.9, JDK 17 and the SDK level selected by the Flutter Gradle extension. From code/ run flutter pub get, flutter analyze, flutter test, then flutter build apk --debug. On a device install the APK with adb install -r. A matching signing certificate and application ID allow Android to retain private storage. For hardware acceptance, download the model, enter airplane mode, dictate a note, wait for silence and verify the final phrase and the microphone indicator. Repeat with a recorded edit, Cancel, Retry and the settings meter.</p>
+<h3>Reconstructing from the chapters alone</h3>
+<p>The Gradle wrapper JAR and Flutter project metadata are SDK scaffold inputs. If the entire code directory is missing, start at the repository root and run <code>flutter create --platforms android --org app --project-name vnotes --no-pub code</code> with Flutter 3.47.9. Remove the scaffold's counter test (<code>code/test/widget_test.dart</code>) and its lint configuration (<code>code/analysis_options.yaml</code>). Run <code>python3 scripts/literate.py</code> to write the application, build configuration, manifests, resources and tests over the scaffold. Run <code>flutter pub get</code> inside code to resolve the lockfile. A checkout already includes the wrapper and lockfile.</p>
+<p>The Android host uses Gradle 9.3.1 and Java 17. Run <code>./gradlew :app:testDebugUnitTest</code> in code/android after the first Flutter build to exercise the energy detector and streaming session independently of the widget test. A debug build using the original signing key can be installed over a previous app.vnotes installation. Keep a private backup of that key separately from the chapters.</p>
 
 <h3><a name="NWD49Hr7Q-R">pubspec.yaml</a></h3>
 <p>Flutter supplies Material widgets and the widget test framework. The build number exceeds that of the earlier Android release.</p>
@@ -2202,6 +2211,12 @@ class LiveSpeechSessionTest {
     }
 }
 </pre><p>
+
+<h3><a name="NWD49Hr7Q-i">Verification record, 2026-11-10</a></h3>
+<p>The tangled project passed Flutter analysis and the widget interaction test for typed entry and tab navigation. The Android build passed assembleDebug and testDebugUnitTest. All eleven native tests passed, covering energy detection, segmentation, streaming order, cancellation and hypothesis replacement. The generation check reproduced both the code files and the woven manual. All 42 internal manual links resolved.</p>
+<p>The test APK identifies as app.vnotes, version 4.0.0 with version code 6 and minimum API 26. Its signing certificate matches the preceding native debug builds. The archive contains Flutter, Moonshine and ONNX Runtime libraries for ARM64, ARMv7 and x86-64. This is a universal debug APK and includes substantial engine debugging assets.</p>
+<p>The build uses the Flutter scaffold's compatibility flags for the Kotlin Gradle plugin and Android DSL. These settings work with the pinned toolchain and emit deprecation warnings. An upgrade to Gradle 10 requires migrating the host to the current built-in Kotlin and Android DSL interfaces.</p>
+<p>Physical-device microphone capture, model download, offline native inference and visual rendering have not been verified for this rewrite. The widget test uses a method-channel double, and the native streaming tests use a deterministic recognition backend. Run the hardware acceptance sequence above before treating speech behavior as device-validated.</p>
 
 
 <ul>
